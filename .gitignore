@@ -1,0 +1,7 @@
+target
+web/*.wasm
+web/*.js
+data/osm/
+.venv/
+data/gtfs/
+data/dem/
