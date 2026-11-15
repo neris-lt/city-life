@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Neon Vilnius</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #05050a; overflow: hidden; }
+  #wrap { position: fixed; inset: 0; }
+  canvas#game { width: 100%; height: 100%; display: block; outline: none; cursor: crosshair; }
+  /* CRT-ish finish: vignette + faint scanlines over the pixel-art frame */
+  #fx { position: fixed; inset: 0; pointer-events: none;
+        background:
+          radial-gradient(ellipse at center, transparent 55%, rgba(4,0,16,.38) 100%);
+  }
+  #loading { position: fixed; inset: 0; display: grid; place-items: center; color: #ff4fc0;
+             font: 700 22px/1 ui-monospace, Menlo, monospace; letter-spacing: .3em; text-shadow: 0 0 18px #ff4fc0; }
+  #osm { position: fixed; right: 8px; top: 6px; font: 10px ui-monospace, Menlo, monospace; color: rgba(255,255,255,.35); pointer-events: none; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="game"></canvas></div>
+<div id="fx"></div>
+<div id="osm">Map data © OpenStreetMap contributors</div>
+<div id="loading">LOADING VILNIUS…</div>
+<script type="module">
+  import init from './neon_district.js';
+  init().catch((e) => { if (!String(e).includes('Using exceptions for control flow')) console.error(e); });
+  const t = setInterval(() => {
+    const c = document.getElementById('game');
+    if (c && c.width > 300) { document.getElementById('loading').remove(); clearInterval(t); }
+  }, 200);
+</script>
+</body>
+</html>
