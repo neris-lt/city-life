@@ -7,6 +7,8 @@ use bevy::light::NotShadowCaster;
 use bevy::prelude::*;
 use std::f32::consts::{PI, TAU};
 
+/// Top speed of a car: 240 km/h.
+pub const TOP_SPEED: f32 = 240.0 / 3.6;
 #[derive(Component)]
 pub struct Player;
 
@@ -28,6 +30,11 @@ pub struct Car {
     pub y: f32,
     pub vy: f32,
     pub max_speed: f32,
+    /// Yaw rate (rad/s), actual angle of the front wheels, and smoothed body-frame
+    /// acceleration (x forward, y right) used for weight transfer and body lean.
+    pub spin: f32,
+    pub wheel: f32,
+    pub acc: Vec2,
 }
 
 #[derive(Component)]
@@ -52,6 +59,8 @@ pub struct BusPath {
     idx: usize,
     stop: usize,
     dwell: f32,
+    /// Where to steer for route point `idx`, snapped into the kerbside lane of the real road.
+    aim: Option<(usize, Vec2)>,
 }
 
 #[derive(Component)]
@@ -149,6 +158,9 @@ pub fn spawn_bus(commands: &mut Commands, art: &Art, mesh: Handle<Mesh>, pos: Ve
                 y: f32::NAN,
                 vy: 0.0,
                 max_speed: 17.0,
+                spin: 0.0,
+                wheel: 0.0,
+                acc: Vec2::ZERO,
             },
             CarAi {
                 edge: 0,
@@ -162,7 +174,7 @@ pub fn spawn_bus(commands: &mut Commands, art: &Art, mesh: Handle<Mesh>, pos: Ve
                 shoot_cd: 1.0,
                 panic: 0.0,
                 done: false,
-                bus: Some(BusPath { route, idx, stop, dwell: 0.0 }),
+                bus: Some(BusPath { route, idx, stop, dwell: 0.0, aim: None }),
             },
             Bus { key },
             Long,
@@ -199,7 +211,10 @@ pub fn spawn_car(commands: &mut Commands, art: &Art, pos: Vec2, heading: f32, ki
                 half: 1.25,
                 y: f32::NAN,
                 vy: 0.0,
-                max_speed: if police { 25.0 } else { 22.0 + (kind as f32) * 0.8 },
+                max_speed: TOP_SPEED,
+                spin: 0.0,
+                wheel: 0.0,
+                acc: Vec2::ZERO,
             },
             Mesh3d(if police {
                 art.police_car.clone()
@@ -389,11 +404,12 @@ pub fn player_control(
     // on foot
     let dir = Vec2::new(ax, -ay).normalize_or_zero();
     // walking animation: alternate the two stride meshes while moving
-    let stride = if dir == Vec2::ZERO { 0 } else { ((game.time * 5.5) as usize) & 1 };
+    let running = keys.pressed(KeyCode::ShiftLeft);
+    let stride = if dir == Vec2::ZERO { 4 } else { ((game.time * if running { 15.0 } else { 10.0 }) as usize) & 3 };
     if pmesh.0 != art.player[stride] {
         pmesh.0 = art.player[stride].clone();
     }
-    let speed = if keys.pressed(KeyCode::ShiftLeft) { 10.5 } else { 6.5 };
+    let speed = if running { 10.5 } else { 6.5 };
     game.vel = dir * speed;
     let want = game.pos + game.vel * dt;
     let (np, _) = if game.y.abs() < 2.5 { world.push_out(want, 0.5) } else { (want, false) };
@@ -406,7 +422,7 @@ pub fn player_control(
     if aim.length_squared() > 0.01 {
         game.heading = aim.y.atan2(aim.x);
     }
-    pt.translation = Vec3::new(game.pos.x, game.y + terrain(game.pos) + 0.2, game.pos.y);
+    pt.translation = Vec3::new(game.pos.x, game.y + terrain(game.pos) + world.foot_y(game.pos), game.pos.y);
     pt.rotation = yaw(game.heading);
 
     if use_key {
@@ -503,7 +519,11 @@ pub fn car_ai(
             } else {
                 let cur = rt.pts[bp.idx];
                 let d = (cur - rt.pts[bp.idx - 1]).normalize_or(Vec2::X);
-                target = cur + right_of(d) * 1.6;
+                // the timetable path is only roughly where the street is: keep to the road itself
+                if bp.aim.is_none_or(|a| a.0 != bp.idx) {
+                    bp.aim = Some((bp.idx, city.bus_lane(cur, d).unwrap_or(cur + right_of(d) * 1.6)));
+                }
+                target = bp.aim.unwrap().1;
                 if (target - pos).dot(d) < 2.5 {
                     bp.idx += 1;
                 }
@@ -568,7 +588,7 @@ pub fn car_ai(
         let diff = wrap(to.y.atan2(to.x) - car.heading);
         car.steer = (diff * 2.2).clamp(-1.0, 1.0);
         ai.panic -= dt;
-        let mut want = if chasing { 22.0 } else if ai.panic > 0.0 { 18.0 } else { ai.cruise };
+        let mut want = if chasing { 22.0 + (pdist - 40.0).clamp(0.0, 120.0) * 0.2 } else if ai.panic > 0.0 { 18.0 } else { ai.cruise };
         if diff.abs() > 0.35 {
             want = want.min(if chasing { 9.0 } else { 6.0 });
         }
@@ -666,37 +686,88 @@ pub fn car_physics(
     for (e, mut t, mut car) in &mut q {
         let mut pos = p2(&t);
         let f = Vec2::from_angle(car.heading);
+        // ---- arcade handling in the manner of classic top-down driving games: the car turns
+        // directly with the keys, its momentum follows the nose with a little lag (so it slides
+        // when thrown into a corner), and the handbrake lets the tail go altogether.
+        let dead = car.health <= 0.0;
+        let thr = if dead { 0.0 } else { car.throttle };
+        let top = car.max_speed * if car.health < 35.0 { 0.7 } else { 1.0 };
+        let airborne = car.vy != 0.0;
+        let ground = if car.y.abs() > 0.4 { S_ROAD } else { world.surface(pos) };
+        let on_road = matches!(ground, S_ROAD | S_PAVING | S_CONCRETE);
+        let wet = ground == S_WATER && !airborne;
         let r = right_of(f);
         let mut vf = car.vel.dot(f);
         let mut vl = car.vel.dot(r);
-        let dead = car.health <= 0.0;
-        let thr = if dead { 0.0 } else { car.throttle };
-        let max = car.max_speed * if car.health < 35.0 { 0.7 } else { 1.0 };
-        if thr > 0.0 {
-            if vf < 0.0 {
-                vf += 26.0 * dt;
-            } else {
-                vf += 15.0 * thr * dt * (1.0 - vf / max).max(0.0);
-            }
-        } else if thr < 0.0 {
-            if vf > 0.5 {
-                vf -= 30.0 * dt;
-            } else {
-                vf += 9.0 * thr * dt * (1.0 + vf / (max * 0.4)).max(0.0);
-            }
+        let inertia = car.half * car.half * 1.2;
+        let grad = if car.y.abs() < 0.3 {
+            Vec2::new(terrain(pos + Vec2::X) - terrain(pos - Vec2::X), terrain(pos + Vec2::Y) - terrain(pos - Vec2::Y)) * 0.5
         } else {
-            vf -= vf.signum() * (2.5 * dt).min(vf.abs());
-        }
-        vf -= vf * 0.12 * dt;
-        let grip = if car.handbrake { 2.2 } else { 8.0 };
-        vl *= (-grip * dt).exp();
-        if car.handbrake {
-            vf *= (-1.6 * dt).exp();
+            Vec2::ZERO
+        };
+        if !airborne {
+            // pedals
+            if thr > 0.0 {
+                if vf < 0.0 {
+                    vf += 34.0 * dt; // braking out of reverse
+                } else {
+                    let x = (vf / top).min(1.0);
+                    vf += 15.0 * thr * dt * (1.0 - x * x) * if on_road { 1.0 } else { 0.6 };
+                }
+            } else if thr < 0.0 {
+                if vf > 0.5 {
+                    vf -= 34.0 * dt * if on_road { 1.0 } else { 0.7 };
+                } else {
+                    vf += 10.0 * thr * dt * (1.0 + vf / 16.0).max(0.0);
+                }
+            } else {
+                // coasting: rolls to a stop and stays there, also on a hill
+                vf -= vf.signum() * ((3.0 + if on_road { 0.0 } else { 4.0 }) * dt).min(vf.abs());
+                if vf.abs() < 0.3 {
+                    vf = 0.0;
+                }
+            }
+            if vf > top {
+                vf -= (vf - top) * (2.0 * dt).min(1.0);
+            }
+            if wet {
+                // in the river: the water stops the car and floods the engine
+                vf *= (-2.5 * dt).exp();
+                car.health -= 22.0 * dt;
+            }
+            // grip: how fast sideways motion dies away. Less in the rain, on grass, at speed, and
+            // next to none with the handbrake on
+            let grip = if car.handbrake {
+                1.4
+            } else {
+                7.5 * (1.0 - 0.3 * game.rain) * if on_road { 1.0 } else { 0.55 } * (1.0 - 0.35 * (vf.abs() / 60.0).min(1.0))
+            };
+            vl *= (-grip * dt).exp();
+            if car.handbrake {
+                vf *= (-1.5 * dt).exp();
+            }
+            // steering: nothing at a standstill, full by about 20 km/h, easing off towards top
+            // speed; sharper with the handbrake. Reversing steers the other way, as it should.
+            let want = car.steer.clamp(-1.0, 1.0);
+            car.wheel += (want - car.wheel) * (1.0 - (-dt / 0.06).exp());
+            let rate = 3.0 * (1.0 - 0.58 * (vf.abs() / 55.0).min(1.0)) * if car.handbrake { 1.3 } else { 1.0 };
+            let turn = car.wheel * rate * (vf / 5.5).clamp(-1.0, 1.0);
+            // knocks from collisions spin the car for a moment on top of that
+            car.heading = wrap(car.heading + (turn + car.spin) * dt);
+            car.spin *= (-4.0 * dt).exp();
+        } else {
+            car.heading = wrap(car.heading + car.spin * dt);
         }
         car.vel = f * vf + r * vl;
-        let turn = car.steer * 2.7 * (vf / 7.0).clamp(-1.0, 1.0) * (1.0 - 0.45 * (vf.abs() / 26.0).min(1.0));
-        car.heading = wrap(car.heading + turn * dt);
         pos += car.vel * dt;
+        // tyres smoke when the car is sliding
+        if !airborne && car.vel.length() > 7.0 && (vl.abs() > 5.5 || car.handbrake) && game.rng.chance(dt * 22.0) {
+            let p = pos - f * car.half;
+            let kind = if game.rain > 0.3 { 4 } else { 2 };
+            puff(&mut commands, art.puffs[kind].clone(), art.glow.clone(), Vec3::new(p.x, terrain(p) + car.y + 0.5, p.y), Vec3::new(0.0, 0.9, 0.0), 0.7, 1.7);
+        }
+        let f = Vec2::from_angle(car.heading);
+        let r = right_of(f);
 
         // static collisions: two circles along the body
         for off in [car.half, -car.half] {
@@ -714,10 +785,8 @@ pub fn car_physics(
                         car.health -= (impact - 5.0) * 2.2;
                         burst(&mut commands, &art, &mut game.rng, 0, Vec3::new(c.x, car.y + 0.8, c.y), 5, 6.0, 0.3, 0.5);
                     }
-                    // nudge heading along the wall
-                    let tang = right_of(n);
-                    let side = f.dot(tang).signum();
-                    car.heading = wrap(car.heading + wrap((tang * side).to_angle() - car.heading) * (3.0 * dt).min(1.0));
+                    // a blow to one end of the car swings it round
+                    car.spin = (car.spin + (f * off).perp_dot(n * (-vn * 1.35)) / inertia * 0.15).clamp(-4.0, 4.0);
                 }
             }
         }
@@ -740,8 +809,14 @@ pub fn car_physics(
             car.y = gy;
             car.vy = 0.0;
         }
-        t.translation = Vec3::new(pos.x, car.y + terrain(pos) + 0.3, pos.y);
-        t.rotation = yaw(car.heading);
+        // wheels on whatever is under them: road, pavement, or down on the grass (and half sunk in water)
+        let lift = if car.y.abs() > 0.4 { 0.3 } else if ground == S_WATER { -0.45 } else { world.foot_y(pos) };
+        t.translation = Vec3::new(pos.x, car.y + terrain(pos) + lift, pos.y);
+        // the body follows the slope it stands on (no squat or roll: the headlight beams are part
+        // of the car and would lift off the road or dig into it)
+        let pitch = grad.dot(f).atan();
+        let roll = -grad.dot(r).atan();
+        t.rotation = yaw(car.heading) * Quat::from_rotation_z(pitch) * Quat::from_rotation_x(roll);
 
         // damage effects
         if car.health < 40.0 && game.rng.chance(dt * 14.0) {
@@ -771,7 +846,7 @@ pub fn car_collisions(mut game: ResMut<Game>, mut q: Query<(Entity, &mut Transfo
         q.iter().map(|(e, t, c)| (e, p2(t), Vec2::from_angle(c.heading), c.vel)).collect();
     let ys: Vec<f32> = q.iter().map(|(_, t, _)| t.translation.y).collect();
     let hs: Vec<f32> = q.iter().map(|(_, _, c)| c.half).collect();
-    let mut fix: Vec<(Entity, Vec2, Vec2, f32)> = vec![];
+    let mut fix: Vec<(Entity, Vec2, Vec2, f32, f32)> = vec![];
     for i in 0..snap.len() {
         for j in (i + 1)..snap.len() {
             let (ea, pa, fa, va) = snap[i];
@@ -790,17 +865,19 @@ pub fn car_collisions(mut game: ResMut<Game>, mut q: Query<(Entity, &mut Transfo
                         let pen = 2.1 - l;
                         let rel = (va - vb).dot(n);
                         let imp = if rel < 0.0 { -rel } else { 0.0 };
-                        fix.push((ea, n * pen * 0.5, n * imp * 0.55, imp));
-                        fix.push((eb, -n * pen * 0.5, -n * imp * 0.55, imp));
+                        let (da, db) = (n * imp * 0.55, -n * imp * 0.55);
+                        fix.push((ea, n * pen * 0.5, da, imp, (fa * oa).perp_dot(da) / (hs[i] * hs[i] * 1.2)));
+                        fix.push((eb, -n * pen * 0.5, db, imp, (fb * ob).perp_dot(db) / (hs[j] * hs[j] * 1.2)));
                     }
                 }
             }
         }
     }
-    for (e, dp, dv, imp) in fix {
+    for (e, dp, dv, imp, twist) in fix {
         if let Ok((_, mut t, mut car)) = q.get_mut(e) {
             t.translation += Vec3::new(dp.x, 0.0, dp.y) * 0.5;
             car.vel += dv * 0.5;
+            car.spin = (car.spin + twist * 0.5).clamp(-6.0, 6.0);
             if imp > 6.0 {
                 car.health -= (imp - 6.0) * 0.8;
             }
@@ -921,14 +998,16 @@ pub fn peds(
             pos += dir * ped.speed * dt;
         }
         let py = world.ground_y(pos, t.translation.y - terrain(p2(&t)));
-        let py_abs = py + terrain(pos) + 0.2;
+        let py_abs = py + terrain(pos) + world.foot_y(pos);
         t.translation = Vec3::new(pos.x, py_abs, pos.y);
         if dir != Vec2::ZERO {
-            t.rotation = yaw(dir.y.atan2(dir.x));
+            // turn smoothly instead of snapping to the new direction
+            let want = yaw(dir.y.atan2(dir.x));
+            t.rotation = t.rotation.slerp(want, 1.0 - (-9.0 * dt).exp());
         }
-        // walking animation (faster when running)
-        let rate = if ped.flee > 0.0 { 7.0 } else { 3.2 };
-        let frame = if dir == Vec2::ZERO { 0 } else { (((game.time + ped.off) * rate) as u8) & 1 };
+        // walking animation: four frames per stride, paced by how fast the person moves
+        let rate = if ped.flee > 0.0 { 13.0 } else { 3.2 * ped.speed };
+        let frame = if dir == Vec2::ZERO { 4 } else { (((game.time + ped.off * 3.0) * rate) as u32 & 3) as u8 };
         if frame != ped.frame {
             ped.frame = frame;
             pmesh.0 = art.peds[ped.var][frame as usize].clone();

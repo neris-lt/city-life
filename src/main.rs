@@ -1,5 +1,6 @@
 mod actors;
 mod art;
+mod landmarks;
 mod maps;
 mod transit;
 mod world;
@@ -196,15 +197,19 @@ fn main() {
             ui_hover: false,
             quality: 1.0,
             cam_flash: Default::default(),
-            rain: 0.6,
-            fog: 0.1,
-            storm: 0.1,
+            rain: 0.0,
+            fog: 0.0,
+            storm: 0.0,
             wind: Vec2::new(5.0, 2.0),
-            weather: "RAIN",
-            clock: 19.6,
-            night: 1.0,
+            weather: "SUNNY",
+            clock: 9.0,
+            night: 0.0,
         })
         .add_systems(Startup, (setup_art, setup_lights, setup, maps::setup_maps).chain())
+        .add_plugins(bevy::pbr::MaterialPlugin::<WaterMaterial>::default())
+        .add_systems(Update, (landmark_tour, water_update))
+        .insert_resource(maps::Search::load())
+        .add_systems(PreUpdate, maps::map_search.after(bevy::input::InputSystems))
         .add_systems(
             Update,
             (
@@ -266,7 +271,7 @@ fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>, mut meshes: 
     // player
     commands.spawn((
         Player,
-        Mesh3d(art.player[0].clone()),
+        Mesh3d(art.player[4].clone()),
         MeshMaterial3d(art.mat.clone()),
         Transform::from_xyz(game.pos.x, 0.0, game.pos.y),
         Visibility::Inherited,
@@ -393,7 +398,7 @@ fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>, mut meshes: 
                 c.spawn((Hud::Msg, Text::new(""), font(44.0), TextColor(Color::srgb(1.0, 0.3, 0.75))));
             });
             p.spawn((
-                Text::new("WASD  MOUSE shoot  F car  SPACE brake  SHIFT run  Q gun  M map  T +1h  +/- zoom  G quality  0-9 travel"),
+                Text::new("WASD  MOUSE shoot  F car  SPACE brake  SHIFT run  Q gun  M map  T +1h  +/- zoom  G quality  0-9 travel  L sights"),
                 font(11.0),
                 TextColor(Color::srgba(1.0, 1.0, 1.0, 0.45)),
                 abs(Node { bottom: px(8), right: px(18), ..default() }),
@@ -482,7 +487,7 @@ fn aim(
         (KeyCode::Digit2, "SENAMIESTIS", 2746.0, 3229.0, 0.0),
         (KeyCode::Digit3, "ZVERYNAS", 500.0, 2600.0, 0.0),
         (KeyCode::Digit4, "KAROLINISKES", -1955.0, 3085.0, 0.0),
-        (KeyCode::Digit5, "ORO UOSTAS", 2752.0, 8500.0, 0.0),
+        (KeyCode::Digit5, "ORO UOSTAS", 2395.0, 7750.0, 0.0),
         (KeyCode::Digit6, "NAUJOJI VILNIA", 10609.0, 2433.0, 0.0),
         (KeyCode::Digit7, "SESKINES VIADUKAS", 75.0, -192.0, 6.0),
         (KeyCode::Digit8, "GELEZINIO VILKO TUNELIS", 1133.0, 2725.0, -6.0),
@@ -508,6 +513,42 @@ fn aim(
     }
 }
 
+/// Feeds the water shader: camera, time, where the light is and what colour the sky is.
+fn water_update(
+    game: Res<Game>,
+    art: Res<Art>,
+    mut waters: ResMut<Assets<WaterMaterial>>,
+    cam: Single<&Transform, With<MainCam>>,
+    light: Single<(&DirectionalLight, &Transform), Without<MainCam>>,
+) {
+    let Some(mut m) = waters.get_mut(&art.water) else { return };
+    let day = 1.0 - game.night;
+    let dull = 1.0 - 0.45 * game.rain.max(game.fog);
+    let to_light = -light.1.forward().as_vec3();
+    let lc = light.0.color.to_linear();
+    // glitter fades under cloud; the moon gives a faint silver one
+    let k = (light.0.illuminance / 3000.0).min(1.3) * (1.0 - 0.8 * game.rain) * (0.25 + 0.75 * day) + 0.12 * (1.0 - day);
+    let sky = Vec3::new(0.05, 0.07, 0.13).lerp(Vec3::new(0.42, 0.56, 0.74), day) * dull;
+    m.p.cam = cam.translation.extend(game.time % 3600.0);
+    m.p.sun = to_light.extend(day);
+    m.p.sky = sky.extend(game.rain);
+    m.p.sunc = (Vec3::new(lc.red, lc.green, lc.blue) * k).extend((game.wind.length() / 24.0).min(1.0));
+}
+
+/// L: visit the next famous place (on foot only).
+fn landmark_tour(keys: Res<ButtonInput<KeyCode>>, city: Res<City>, mut game: ResMut<Game>, mut next: Local<usize>) {
+    if keys.just_pressed(KeyCode::KeyL) && game.in_car.is_none() && game.dead_t <= 0.0 && !city.landmarks.is_empty() {
+        let l = &city.landmarks[*next % city.landmarks.len()];
+        *next += 1;
+        // arrive on its south side, so the camera looks across you at the building
+        let r = l.pts.iter().map(|p| (p.y - l.c.y).abs()).fold(6.0, f32::max);
+        game.pos = l.c + Vec2::new(0.0, r + 7.0);
+        game.y = 0.0;
+        game.travel_hold = 3.0;
+        game.say(landmarks::name(l.kind), 3.0);
+    }
+}
+
 fn camera_follow(
     time: Res<Time>,
     mut game: ResMut<Game>,
@@ -517,11 +558,12 @@ fn camera_follow(
 ) {
     let dt = time.delta_secs();
     let speed = game.vel.length();
-    let mut want = game.pos + game.vel * 0.45;
+    // look further ahead the faster the car goes, so there is time to react
+    let mut want = game.pos + (game.vel * 0.7).clamp_length_max(42.0);
     if game.in_car.is_none() {
         want += (game.aim - game.pos).clamp_length_max(40.0) * 0.12;
     }
-    let want_h = game.y.max(0.0) + game.zoom * if game.in_car.is_some() { 52.0 + speed * 0.8 } else { 44.0 };
+    let want_h = game.y.max(0.0) + game.zoom * if game.in_car.is_some() { 52.0 + (speed * 1.0).min(46.0) } else { 44.0 };
     let k = 1.0 - (-4.0 * dt).exp();
     let cur = game.cam_focus;
     let np = if cur.distance(want) > 300.0 { want } else { cur.lerp(want, k) };
@@ -546,7 +588,7 @@ fn camera_follow(
     if game.in_car.is_some() {
         let p = game.pos + f * 7.0;
         lamp.0.translation = Vec3::new(p.x, terrain(p) + game.y + 2.2, p.y);
-        lamp.1.intensity = LIGHT_POWER * 0.9 * (0.1 + 0.9 * game.night);
+        lamp.1.intensity = LIGHT_POWER * 0.9 * game.night; // no pool of headlight on the road by day
     } else {
         lamp.0.translation = Vec3::new(game.pos.x, terrain(game.pos) + game.y + 3.0, game.pos.y);
         lamp.1.intensity = LIGHT_POWER * 0.12 * game.night;
@@ -566,7 +608,7 @@ fn rain(
     // wind slants the streaks; heavier weather puts more of the drop pool in the air
     let vel = Vec3::new(game.wind.x, -62.0, game.wind.y);
     let rot = Quat::from_rotation_arc(Vec3::Y, -vel.normalize());
-    let amount = 0.12 + game.rain * 0.88;
+    let amount = if game.rain < 0.03 { -1.0 } else { 0.12 + game.rain * 0.88 };
     for (mut t, r) in &mut drops {
         if r.0 > amount {
             if t.translation.y > -40.0 {
@@ -678,16 +720,26 @@ struct WeatherState {
     flash: f32,
     wet: f32,
     night: f32,
+    cloud: f32,
+    started: bool,
+    /// Whether the light materials have been set for the time of day yet.
+    lit: bool,
 }
 
-/// Weather front: (label, rain, fog, storm).
-const FRONTS: [(&str, f32, f32, f32); 6] = [
-    ("RAIN", 0.6, 0.1, 0.1),
-    ("DOWNPOUR", 0.95, 0.15, 0.45),
-    ("THUNDERSTORM", 1.0, 0.0, 1.0),
-    ("DRIZZLE", 0.28, 0.25, 0.0),
-    ("FOG", 0.1, 1.0, 0.0),
-    ("RAIN", 0.55, 0.2, 0.2),
+/// Weather front: (label, rain, fog, storm, cloud cover). The order is a plausible progression;
+/// each change steps one or two entries forward.
+const FRONTS: [(&str, f32, f32, f32, f32); 11] = [
+    ("CLEAR", 0.0, 0.0, 0.0, 0.0),
+    ("PARTLY CLOUDY", 0.0, 0.0, 0.0, 0.35),
+    ("OVERCAST", 0.0, 0.08, 0.0, 0.85),
+    ("DRIZZLE", 0.28, 0.25, 0.0, 0.8),
+    ("RAIN", 0.6, 0.1, 0.1, 0.9),
+    ("DOWNPOUR", 0.95, 0.15, 0.45, 1.0),
+    ("THUNDERSTORM", 1.0, 0.0, 1.0, 1.0),
+    ("RAIN", 0.55, 0.2, 0.2, 0.9),
+    ("PARTLY CLOUDY", 0.0, 0.0, 0.0, 0.4),
+    ("CLEAR", 0.0, 0.0, 0.0, 0.0),
+    ("FOG", 0.05, 1.0, 0.0, 0.7),
 ];
 
 /// Changing weather, lightning, mist, wet-road shine and the shadow range that follows the camera.
@@ -709,16 +761,21 @@ fn weather(
     // drift between fronts
     st.phase_t -= dt;
     if st.phase_t <= 0.0 {
-        st.phase = (st.phase + 1 + game.rng.int(2) as usize) % FRONTS.len();
+        // the first front is the clear one the game starts in
+        if st.started {
+            st.phase = (st.phase + 1 + game.rng.int(2) as usize) % FRONTS.len();
+        }
+        st.started = true;
         st.phase_t = game.rng.range(40.0, 75.0);
     }
-    let (label, rain, fog, storm) = FRONTS[st.phase];
-    game.weather = label;
+    let (label, rain, fog, storm, cloud) = FRONTS[st.phase];
+    game.weather = if label == "CLEAR" && game.night < 0.5 { "SUNNY" } else { label };
     let k = (dt * 0.12).min(1.0);
+    st.cloud += (cloud - st.cloud) * k;
     game.rain += (rain - game.rain) * k;
     game.fog += (fog - game.fog) * k;
     game.storm += (storm - game.storm) * k;
-    game.wind = Vec2::from_angle(game.time * 0.03) * (4.0 + game.storm * 20.0 + game.rain * 4.0);
+    game.wind = Vec2::from_angle(game.time * 0.03) * (2.0 + st.cloud * 2.0 + game.storm * 20.0 + game.rain * 4.0);
 
     // mist drifts with the wind; fog banks roll in when it turns foggy
     let f = game.cam_focus;
@@ -735,11 +792,11 @@ fn weather(
         if d.y.abs() > 80.0 {
             t.translation.z = f.y - d.y.signum() * 75.0;
         }
-        if m.1 {
-            let want = if foggy { Visibility::Inherited } else { Visibility::Hidden };
-            if *vis != want {
-                *vis = want;
-            }
+        // fog banks only in fog; the thin ground mist clears on dry days
+        let show = if m.1 { foggy } else { game.rain.max(game.fog) > 0.1 || game.night > 0.6 };
+        let want = if show { Visibility::Inherited } else { Visibility::Hidden };
+        if *vis != want {
+            *vis = want;
         }
     }
 
@@ -751,7 +808,7 @@ fn weather(
     }
 
     // lightning: the whole city flashes white-blue and every building throws a hard shadow
-    st.strike_t -= dt * (0.12 + game.storm * 1.6);
+    st.strike_t -= dt * game.storm * 1.75; // no lightning out of a dry sky
     if st.strike_t <= 0.0 {
         st.strike_t = game.rng.range(5.0, 12.0);
         st.flash = 1.0;
@@ -761,6 +818,8 @@ fn weather(
     }
     st.flash = (st.flash - dt * 2.4).max(0.0);
     let fl = if st.flash > 0.0 { st.flash * (0.5 + 0.5 * (st.flash * 38.0).sin()) } else { 0.0 };
+    // in daylight a strike is a flicker, not a white-out of the whole screen
+    let fl = fl * (0.08 + 0.92 * game.night);
     // ---- day / night: one in-game hour per real minute ----
     game.clock = (game.clock + dt / 60.0) % 24.0;
     let c = game.clock;
@@ -770,14 +829,19 @@ fn weather(
     game.night = 1.0 - dayf;
     // the sun crosses from east to west; at night the moon sits in a fixed spot
     let a = (c - 6.0) / 14.0 * std::f32::consts::PI;
-    let sun_dir = Vec3::new(-a.cos() * 0.9, -(0.3 + sun * 0.9), 0.3).normalize();
+    // (it stands in the south, as it does over Vilnius: fronts facing the camera are sunlit and
+    // shadows fall away behind the buildings)
+    let sun_dir = Vec3::new(-a.cos() * 0.9, -(0.3 + sun * 0.9), -0.42).normalize();
     let moon_dir = Vec3::new(0.5, -1.0, 0.38).normalize();
     let dir = moon_dir.lerp(sun_dir, dayf).normalize();
     *moon.2 = Transform::default().looking_to(dir, Vec3::Y);
-    let overcast = 1.0 - 0.45 * game.rain.max(game.fog);
+    let overcast = 1.0 - 0.45 * st.cloud.max(game.fog);
+    // direct sunlight is much stronger under an open sky, and the moon a little
+    let open = (1.0 - st.cloud) * (1.0 - game.fog);
+    let direct = (0.45 + 0.55 * overcast) * (1.0 + 0.7 * open);
     let warm = 1.0 - sun; // low sun is orange
     let (lr, lg, lb) = (1.0, 0.95 - warm * 0.35, 0.86 - warm * 0.5);
-    moon.0.illuminance = (680.0 * (1.0 - game.fog * 0.5)) * (1.0 - dayf) + 1900.0 * (0.3 + 0.7 * sun) * overcast * dayf + fl * 16000.0;
+    moon.0.illuminance = (680.0 * (1.0 - game.fog * 0.5) * (0.85 + 0.3 * open)) * (1.0 - dayf) + 1900.0 * (0.3 + 0.7 * sun) * direct * dayf + fl * 16000.0;
     moon.0.color = Color::srgb(
         (0.6 + (lr - 0.6) * dayf + fl * 0.35).min(1.0),
         (0.72 + (lg - 0.72) * dayf + fl * 0.25).min(1.0),
@@ -786,14 +850,15 @@ fn weather(
     ambient.brightness = (90.0 * (1.0 + game.fog * 0.9)) * (1.0 - dayf) + 330.0 * overcast * dayf + fl * 700.0;
     ambient.color = Color::srgb(0.45 + 0.3 * dayf, 0.5 + 0.34 * dayf, 1.0);
     // neon, windows and glows fade with daylight
-    if (game.night - st.night).abs() > 0.015 || st.shadow == 0.0 {
+    if (game.night - st.night).abs() > 0.015 || !st.lit {
+        st.lit = true;
         st.night = game.night;
         if let Some(mut m) = mats.get_mut(&art.mat) {
             let e = 2.6 * (0.16 + 0.84 * game.night);
             m.emissive = LinearRgba::rgb(e, e, e);
         }
         if let Some(mut m) = mats.get_mut(&art.glow) {
-            let g = 1.7 * (0.1 + 0.9 * game.night);
+            let g = 1.7 * game.night;
             m.base_color = Color::linear_rgb(g, g, g);
         }
     }
@@ -814,6 +879,9 @@ fn weather(
             if let Some(mut mat) = mats.get_mut(&art.tiled[m]) {
                 mat.perceptual_roughness = (dry + (wet - dry) * st.wet).min(1.0);
             }
+        }
+        if let Some(mut mat) = mats.get_mut(&art.deck) {
+            mat.perceptual_roughness = 1.0 - 0.38 * st.wet;
         }
     }
 }
@@ -850,7 +918,8 @@ fn car_lights(
                 let red = ((game.time * 7.0) as usize + i) % 2 == 0;
                 t.translation = *pos + Vec3::Y * 2.6;
                 l.color = if red { Color::srgb(1.0, 0.08, 0.08) } else { Color::srgb(0.1, 0.25, 1.0) };
-                l.intensity = LIGHT_POWER * 1.3;
+                // (by day the beacons flash but do not flood the street with colour)
+                l.intensity = LIGHT_POWER * 1.3 * (0.12 + 0.88 * game.night);
             }
             _ => l.intensity = 0.0,
         }
@@ -868,7 +937,7 @@ fn spray(mut commands: Commands, time: Res<Time>, art: Res<Art>, mut game: ResMu
         if speed < 8.0 || p.distance(f) > 70.0 {
             continue;
         }
-        if game.rng.chance(dt * speed * (0.3 + game.rain) * 0.9) {
+        if game.rng.chance(dt * speed * game.rain * 1.2) {
             let back = p - Vec2::from_angle(c.heading) * 2.2;
             burst(&mut commands, &art, &mut game.rng, 4, Vec3::new(back.x, if c.y.is_nan() { 0.4 } else { c.y + 0.4 }, back.y), 1, speed * 0.25, 0.55, 2.0);
         }

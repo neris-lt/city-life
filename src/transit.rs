@@ -159,7 +159,7 @@ pub fn bus_spawner(
                 .entry((r.name.clone(), r.kind))
                 .or_insert_with(|| meshes.add(bus_mesh(&r.name, r.kind)))
                 .clone();
-            let p = pos + Vec2::new(-dir.y, dir.x) * 1.6;
+            let p = city.bus_lane(pos, dir).unwrap_or(pos + Vec2::new(-dir.y, dir.x) * 1.6);
             spawn_bus(&mut commands, &art, mesh, p, dir.y.atan2(dir.x), ri as u16, idx, stop.unwrap_or(r.stops.len()), key);
             spawned += 1;
             if spawned >= 2 {

@@ -297,7 +297,7 @@ fn paint(t: u32, x: i32, y: i32) -> Px {
         }
         T_CROSS => {
             let mut p = asphalt(n);
-            if (x / 4) % 2 == 0 && (4..28).contains(&y) && n > 0.18 {
+            if (x / 4) % 2 == 0 && n > 0.1 {
                 p.c = g3(0.45);
             }
             p
@@ -426,7 +426,7 @@ fn paint(t: u32, x: i32, y: i32) -> Px {
         T_CONE => {
             let u = x as f32 / 31.0;
             let w = 2.0 + u * 13.0;
-            glow((1.0 - fy.abs() / w).max(0.0) * (1.0 - u).powf(1.3))
+            glow((1.0 - fy.abs() / w).max(0.0).powf(1.6) * (1.0 - u).powf(1.7))
         }
         T_SOLID => glow(1.0),
         T_RING => glow(if (d - 12.5).abs() < 1.3 { 1.0 } else { 0.0 }),
@@ -510,22 +510,137 @@ pub const M_WATER: usize = 3;
 pub const M_GRASS: usize = 4;
 pub const M_ROOF: usize = 5;
 /// Metres covered by one repeat of each tiled texture.
-pub const M_SPAN: [f32; 6] = [16.0, 4.0, 4.0, 4.0, 8.0, 8.0];
+pub const M_SPAN: [f32; 6] = [16.0, 4.0, 4.0, 16.0, 16.0, 8.0];
+/// Texture size in pixels for each of them (asphalt and grass are drawn at full detail).
+const M_RES: [usize; 6] = [512, 64, 64, 512, 1024, 128];
 
 fn pnoise(x: f32, y: f32, period: i32, seed: u32) -> f32 {
+    pn(x, y, period, period, seed)
+}
+
+/// Smooth value noise that repeats after `px` cells across and `py` cells down.
+fn pn(x: f32, y: f32, px: i32, py: i32, seed: u32) -> f32 {
     let xi = x.floor();
     let yi = y.floor();
     let fx = x - xi;
     let fy = y - yi;
     let sx = fx * fx * (3.0 - 2.0 * fx);
     let sy = fy * fy * (3.0 - 2.0 * fy);
-    let w = |v: i32| v.rem_euclid(period);
+    let w = |v: i32| v.rem_euclid(px);
+    let h = |v: i32| v.rem_euclid(py);
     let (xi, yi) = (xi as i32, yi as i32);
-    let a = hf(w(xi), w(yi), seed);
-    let b = hf(w(xi + 1), w(yi), seed);
-    let c = hf(w(xi), w(yi + 1), seed);
-    let d = hf(w(xi + 1), w(yi + 1), seed);
+    let a = hf(w(xi), h(yi), seed);
+    let b = hf(w(xi + 1), h(yi), seed);
+    let c = hf(w(xi), h(yi + 1), seed);
+    let d = hf(w(xi + 1), h(yi + 1), seed);
     a + (b - a) * sx + (c - a) * sy + (a - b - c + d) * sx * sy
+}
+
+fn sstep(a: f32, b: f32, x: f32) -> f32 {
+    let t = ((x - a) / (b - a)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+fn mix3(a: [f32; 3], b: [f32; 3], t: f32) -> [f32; 3] {
+    [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t]
+}
+
+/// Tarmac at full texture resolution: aggregate grain, soft wear and repair patches, hairline
+/// cracks and damp patches with feathered edges.
+fn asphalt_px(x: i32, y: i32, size: usize) -> Px {
+    let k = 1.0 / size as f32;
+    let (u, v) = (x as f32 * k, y as f32 * k);
+    let grain = hf(x, y, 5) * 0.45 + hf(x / 2, y / 2, 6) * 0.35 + hf(x / 4, y / 4, 7) * 0.2;
+    let tone = pn(u * 6.0, v * 6.0, 6, 6, 31) * 0.6 + pn(u * 22.0, v * 22.0, 22, 22, 32) * 0.4;
+    let b = 0.035 + grain * 0.028 + (tone - 0.5) * 0.014;
+    let mut c = [b * 0.92, b * 0.97, b * 1.28];
+    let mut r = 0.38 + grain * 0.2;
+    // newer repair patch
+    let patch = sstep(0.66, 0.7, pn(u * 5.0, v * 5.0, 5, 5, 33));
+    c = mul(c, 1.0 - 0.13 * patch);
+    r -= 0.08 * patch;
+    // cracks, only in the more worn areas
+    let crack = pn(u * 26.0, v * 26.0, 26, 26, 8) * 0.8 + pn(u * 90.0, v * 90.0, 90, 90, 18) * 0.2;
+    let worn = sstep(0.45, 0.65, pn(u * 4.0, v * 4.0, 4, 4, 44));
+    let line = 1.0 - sstep(0.004, 0.014, (crack - 0.5).abs());
+    c = mul(c, 1.0 - 0.5 * line * worn);
+    // damp patches
+    let w = pn(u * 9.0, v * 9.0, 9, 9, 3) * 0.75 + pn(u * 32.0, v * 32.0, 32, 32, 4) * 0.25;
+    let wet = sstep(0.64, 0.8, w);
+    // (only a little smoother and darker: rain makes the whole road glossy, sun leaves no stains)
+    c = mix3(c, [0.03, 0.036, 0.055], wet * 0.1);
+    r += (0.36 - r) * wet;
+    if hf(x, y, 77) > 0.992 {
+        c = mul(c, 2.0); // glint of a stone chip
+    }
+    Px { c, e: g3(0.0), r, m: 0.0 }
+}
+
+/// Height of the water surface at texture position (u, v): three sizes of ripple.
+fn wave(u: f32, v: f32) -> f32 {
+    pn(u * 10.0, v * 6.0, 10, 6, 61) * 0.5 + pn(u * 26.0, v * 18.0, 26, 18, 62) * 0.3 + pn(u * 70.0, v * 54.0, 70, 54, 63) * 0.2
+}
+
+/// River water: deep blue-green with lighter shallows and streaks, smooth enough to mirror the sun.
+fn water_px(x: i32, y: i32, size: usize) -> Px {
+    let k = 1.0 / size as f32;
+    let (u, v) = (x as f32 * k, y as f32 * k);
+    let depth = pn(u * 3.0, v * 3.0, 3, 3, 64) * 0.6 + pn(u * 9.0, v * 9.0, 9, 9, 65) * 0.4;
+    let h = wave(u, v);
+    let mut c = mix3([0.012, 0.05, 0.085], [0.03, 0.105, 0.13], sstep(0.3, 0.75, depth));
+    // crests are a touch lighter, troughs darker
+    c = mul(c, 0.8 + 0.45 * h);
+    // drifting streaks of foam and silt
+    let streak = pn(u * 6.0, v * 40.0, 6, 40, 66);
+    c = mix3(c, [0.09, 0.15, 0.16], sstep(0.78, 0.95, streak) * 0.35);
+    Px { c, e: g3(0.0), r: 0.07 + 0.12 * (1.0 - h), m: 0.0 }
+}
+
+/// Normal map of the ripples in `wave`, so the surface glints as light plays over it.
+pub fn water_normal() -> Image {
+    let size = M_RES[M_WATER];
+    let k = 1.0 / size as f32;
+    let mut data = vec![0u8; size * size * 4];
+    for y in 0..size {
+        for x in 0..size {
+            let (u, v) = (x as f32 * k, y as f32 * k);
+            let dx = (wave(u + k, v) - wave(u - k, v)) * 9.0;
+            let dy = (wave(u, v + k) - wave(u, v - k)) * 9.0;
+            let n = Vec3::new(-dx, -dy, 1.0).normalize();
+            let o = (y * size + x) * 4;
+            data[o] = ((n.x * 0.5 + 0.5) * 255.0) as u8;
+            data[o + 1] = ((n.y * 0.5 + 0.5) * 255.0) as u8;
+            data[o + 2] = ((n.z * 0.5 + 0.5) * 255.0) as u8;
+            data[o + 3] = 255;
+        }
+    }
+    mip_image(size, data, TextureFormat::Rgba8Unorm)
+}
+
+/// Lawn at full texture resolution: lusher and drier patches, mottling, individual blades.
+fn grass_px(x: i32, y: i32, size: usize) -> Px {
+    let k = 1.0 / size as f32;
+    let (u, v) = (x as f32 * k, y as f32 * k);
+    let broad = pn(u * 4.0, v * 4.0, 4, 4, 9) * 0.6 + pn(u * 11.0, v * 11.0, 11, 11, 10) * 0.4;
+    let mott = pn(u * 72.0, v * 72.0, 72, 72, 11);
+    // blades: fine noise stretched along two directions
+    let blade = pn(u * 340.0, v * 96.0, 340, 96, 12) * 0.55 + pn(u * 112.0, v * 300.0, 112, 300, 13) * 0.45;
+    let h = hf(x, y, 13);
+    // (the broad patches are kept faint: they repeat with the texture and show from high up)
+    let t = (0.26 + broad * 0.22 + mott * 0.34).clamp(0.0, 1.0);
+    let mut c = mix3([0.012, 0.042, 0.017], [0.046, 0.135, 0.04], t);
+    // drier, yellower turf in the thin patches
+    let dry = sstep(0.42, 0.2, broad);
+    c = mix3(c, [0.06, 0.085, 0.03], dry * 0.07);
+    c = mul(c, (0.62 + 0.76 * blade) * (0.93 + 0.14 * h));
+    if blade > 0.8 && h > 0.5 {
+        c = mul(c, 1.35); // blades catching the light
+    }
+    // daisies and dandelions, a few centimetres across
+    let f = hf(x / 4, y / 4, 21);
+    if f > 0.9988 {
+        c = if hf(x / 4, y / 4, 22) > 0.5 { [0.3, 0.26, 0.07] } else { [0.3, 0.3, 0.27] };
+    }
+    Px { c, e: g3(0.0), r: 0.88 + 0.08 * blade, m: 0.0 }
 }
 
 fn tiled_px(kind: usize, x: i32, y: i32) -> Px {
@@ -565,18 +680,19 @@ fn tiled_px(kind: usize, x: i32, y: i32) -> Px {
             let joint = (x + off) % 4 == 0 || y % 2 == 0 && hf(bx, by, 3) < 0.5;
             let tone = hf((x + off) / 4, by, 6);
             let b = if joint { 0.075 } else { 0.105 + tone * 0.025 + n * 0.01 };
-            let wet = pnoise(x as f32 / 8.0, y as f32 / 8.0, 4, 14) > 0.66;
-            Px { c: if wet { [b * 0.6, b * 0.62, b * 0.8] } else { [b, b * 0.98, b * 1.16] }, e: g3(0.0), r: if wet { 0.1 } else { 0.5 }, m: 0.0 }
+            // damp patches fade in softly rather than ending at a hard outline
+            let wet = sstep(0.6, 0.82, pnoise(x as f32 / 8.0, y as f32 / 8.0, 4, 14)) * 0.4;
+            Px { c: mix3([b, b * 0.98, b * 1.16], [b * 0.6, b * 0.62, b * 0.8], wet), e: g3(0.0), r: 0.5 - 0.3 * wet, m: 0.0 }
         }
         M_CONCRETE => {
             let slab = x % 32 == 0 || y % 32 == 0;
             let stain = pnoise(x as f32 / 8.0, y as f32 / 8.0, 4, 19);
-            let b = if slab { 0.035 } else { 0.07 + n * 0.02 - (stain - 0.5).max(0.0) * 0.06 };
+            let b = if slab { 0.035 } else { 0.07 + n * 0.02 - (stain - 0.5).max(0.0) * 0.03 };
             let bay = y % 32 < 1 || (x % 16 == 0 && y % 32 < 22);
             if bay && n > 0.2 {
                 return Px { c: g3(0.2), e: g3(0.0), r: 0.5, m: 0.0 };
             }
-            Px { c: [b, b, b * 1.12], e: g3(0.0), r: if stain > 0.62 { 0.12 } else { 0.5 }, m: 0.0 }
+            Px { c: [b, b, b * 1.12], e: g3(0.0), r: 0.5 - 0.22 * sstep(0.55, 0.8, stain), m: 0.0 }
         }
         M_WATER => paint(T_WATER, x % 32, y % 32),
         M_GRASS => {
@@ -615,13 +731,60 @@ fn tiled_px(kind: usize, x: i32, y: i32) -> Px {
     }
 }
 
-fn tiled_images(kind: usize) -> (Image, Image) {
+/// Square repeating texture with a full mip chain.
+fn mip_image(size: usize, data: Vec<u8>, fmt: TextureFormat) -> Image {
     use bevy::image::{ImageAddressMode, ImageSamplerDescriptor};
-    let size: usize = (M_SPAN[kind] * 16.0) as usize;
+    {
+        // full mip chain (box filtered) so the ground stays smooth instead of sparkling when
+        // seen from high up or at a slant
+        let mut all = data.clone();
+        let (mut prev, mut w, mut levels) = (data.clone(), size, 1u32);
+        while w > 1 {
+            let h = w / 2;
+            let mut next = vec![0u8; h * h * 4];
+            for y in 0..h {
+                for x in 0..h {
+                    for k in 0..4 {
+                        let at = |xx: usize, yy: usize| prev[(yy * w + xx) * 4 + k] as u32;
+                        next[(y * h + x) * 4 + k] =
+                            ((at(x * 2, y * 2) + at(x * 2 + 1, y * 2) + at(x * 2, y * 2 + 1) + at(x * 2 + 1, y * 2 + 1) + 2) / 4) as u8;
+                    }
+                }
+            }
+            all.extend_from_slice(&next);
+            prev = next;
+            w = h;
+            levels += 1;
+        }
+        let mut img = Image::new(
+            Extent3d { width: size as u32, height: size as u32, depth_or_array_layers: 1 },
+            TextureDimension::D2,
+            data,
+            fmt,
+            RenderAssetUsages::RENDER_WORLD,
+        );
+        img.texture_descriptor.mip_level_count = levels;
+        img.data = Some(all);
+        img.sampler = ImageSampler::Descriptor(ImageSamplerDescriptor {
+            address_mode_u: ImageAddressMode::Repeat,
+            address_mode_v: ImageAddressMode::Repeat,
+            ..ImageSamplerDescriptor::linear()
+        });
+        img
+    }
+}
+
+fn tiled_images(kind: usize) -> (Image, Image) {
+    let size: usize = M_RES[kind];
     let (mut base, mut mr) = (vec![0u8; size * size * 4], vec![0u8; size * size * 4]);
     for y in 0..size {
         for x in 0..size {
-            let mut p = tiled_px(kind, (x / 2) as i32, (y / 2) as i32);
+            let mut p = match kind {
+                M_ASPHALT => asphalt_px(x as i32, y as i32, size),
+                M_GRASS => grass_px(x as i32, y as i32, size),
+                M_WATER => water_px(x as i32, y as i32, size),
+                _ => tiled_px(kind, (x / 2) as i32, (y / 2) as i32),
+            };
             p.c = mul(p.c, 0.94 + 0.12 * hf(x as i32, y as i32, 9000 + kind as u32));
             p.c = mul(p.c, if kind == M_WATER { 1.0 } else { 1.7 });
             let o = (y * size + x) * 4;
@@ -634,22 +797,37 @@ fn tiled_images(kind: usize) -> (Image, Image) {
             mr[o + 3] = 255;
         }
     }
-    let mk = |data: Vec<u8>, fmt: TextureFormat| {
-        let mut img = Image::new(
-            Extent3d { width: size as u32, height: size as u32, depth_or_array_layers: 1 },
-            TextureDimension::D2,
-            data,
-            fmt,
-            RenderAssetUsages::RENDER_WORLD,
-        );
-        img.sampler = ImageSampler::Descriptor(ImageSamplerDescriptor {
-            address_mode_u: ImageAddressMode::Repeat,
-            address_mode_v: ImageAddressMode::Repeat,
-            ..ImageSamplerDescriptor::linear()
-        });
-        img
-    };
+    let mk = |data: Vec<u8>, fmt: TextureFormat| mip_image(size, data, fmt);
     (mk(base, TextureFormat::Rgba8UnormSrgb), mk(mr, TextureFormat::Rgba8Unorm))
+}
+
+/// Animated water surface (see `web/assets/shaders/water.wgsl`).
+#[derive(Asset, TypePath, bevy::render::render_resource::AsBindGroup, Clone)]
+pub struct WaterMaterial {
+    #[uniform(0)]
+    pub p: WaterParams,
+}
+
+#[derive(bevy::render::render_resource::ShaderType, Clone, Default)]
+pub struct WaterParams {
+    /// Camera position, w = time.
+    pub cam: Vec4,
+    /// Direction towards the sun or moon, w = daylight.
+    pub sun: Vec4,
+    /// Reflected sky colour, w = rain.
+    pub sky: Vec4,
+    /// Glitter colour, w = wind.
+    pub sunc: Vec4,
+    /// Colour of the water body.
+    pub deep: Vec4,
+    /// xy = drift direction.
+    pub flow: Vec4,
+}
+
+impl bevy::pbr::Material for WaterMaterial {
+    fn fragment_shader() -> bevy::shader::ShaderRef {
+        "shaders/water.wgsl".into()
+    }
 }
 
 /// Builder for flat, upward-facing geometry textured in world space.
@@ -705,7 +883,10 @@ impl Flat {
     }
     pub fn build(self) -> Mesh {
         let n = vec![[0.0, 1.0, 0.0]; self.p.len()];
+        // tangents follow the world-space texture mapping (needed by the water's normal map)
+        let tg = vec![[1.0, 0.0, 0.0, -1.0]; self.p.len()];
         Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::RENDER_WORLD)
+            .with_inserted_attribute(Mesh::ATTRIBUTE_TANGENT, tg)
             .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, self.p)
             .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, n)
             .with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, self.uv)
@@ -754,6 +935,23 @@ impl MB {
             self.p.push(v[k].to_array());
             self.n.push(nrm.to_array());
             self.uv.push(uvs[(k + rot) % 4]);
+            self.c.push(col);
+        }
+        self.i.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+    }
+
+    /// Like `quad`, but with a normal per corner (smooth-shaded surfaces).
+    pub fn quad_n(&mut self, v: [Vec3; 4], n: [Vec3; 4], tile: u32, col: [f32; 4]) {
+        let base = self.p.len() as u32;
+        let (tx, ty) = ((tile as usize % AT) as f32, (tile as usize / AT) as f32);
+        let (e, s) = (0.6, ASIZE as f32);
+        let (u0, u1) = ((tx * TS as f32 + e) / s, ((tx + 1.0) * TS as f32 - e) / s);
+        let (v0, v1) = ((ty * TS as f32 + e) / s, ((ty + 1.0) * TS as f32 - e) / s);
+        let uvs = [[u0, v0], [u0, v1], [u1, v1], [u1, v0]];
+        for k in 0..4 {
+            self.p.push([v[k].x, v[k].y + self.lift, v[k].z]);
+            self.n.push(n[k].to_array());
+            self.uv.push(uvs[k]);
             self.c.push(col);
         }
         self.i.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
@@ -858,6 +1056,8 @@ pub struct Art {
     pub mat: Handle<StandardMaterial>,
     pub glow: Handle<StandardMaterial>,
     pub tiled: Vec<Handle<StandardMaterial>>,
+    /// The river surface.
+    pub water: Handle<WaterMaterial>,
     /// Bridge decks: fades out while the player is underneath.
     pub deck: Handle<StandardMaterial>,
     /// Soft black overlay for contact shadows (alpha comes from vertex colour).
@@ -867,9 +1067,9 @@ pub struct Art {
     pub police_car: Handle<Mesh>,
     pub car_glow: Handle<Mesh>,
     pub police_glow: Handle<Mesh>,
-    /// Each person has two meshes: the two halves of a walking stride.
-    pub peds: Vec<[Handle<Mesh>; 2]>,
-    pub player: [Handle<Mesh>; 2],
+    /// Each person has five meshes: four frames of a walking cycle, then standing still.
+    pub peds: Vec<[Handle<Mesh>; 5]>,
+    pub player: [Handle<Mesh>; 5],
     pub bullet: Handle<Mesh>,
     pub puffs: Vec<Handle<Mesh>>, // 0 spark, 1 fire, 2 smoke, 3 flash, 4 spray
     pub blood: Handle<Mesh>,
@@ -912,111 +1112,383 @@ fn section(m: &mut MB, profile: &[(f32, f32)], y0: f32, w0: f32, w1: f32, tile: 
     }
 }
 
-/// Car body styles: 0 saloon, 1 hatchback, 2 van / SUV.
+/// Round wheel on a sideways axle at (x, z), standing on y = 0: tread, sidewall and a hubcap
+/// on the outward face (`s` = +1 / -1 for the side of the vehicle).
+fn wheel(m: &mut MB, x: f32, z: f32, s: f32, r: f32, hw: f32) {
+    const N: usize = 16;
+    let chrome = [0.75, 0.78, 0.85, 1.0];
+    let wall = [0.55, 0.55, 0.6, 1.0];
+    let pt = |k: usize, rr: f32, zz: f32| {
+        let a = k as f32 / N as f32 * std::f32::consts::TAU;
+        Vec3::new(x + a.cos() * rr, r + a.sin() * rr, zz)
+    };
+    let zo = z + s * hw;
+    let hub = Vec3::new(x, r, zo + s * 0.03);
+    for k in 0..N {
+        let a = (k as f32 + 0.5) / N as f32 * std::f32::consts::TAU;
+        face(m, [pt(k, r, z - hw), pt(k, r, z + hw), pt(k + 1, r, z + hw), pt(k + 1, r, z - hw)], Vec3::new(a.cos(), a.sin(), 0.0), T_TYRE, WHITE);
+        face(m, [pt(k, r, zo), pt(k + 1, r, zo), pt(k + 1, r * 0.64, zo + s * 0.03), pt(k, r * 0.64, zo + s * 0.03)], Vec3::Z * s, T_TYRE, wall);
+        // hubcap: a fan of triangles (quad with a doubled corner)
+        let (p0, p1) = (pt(k, r * 0.64, zo + s * 0.03), pt(k + 1, r * 0.64, zo + s * 0.03));
+        face(m, [hub, p0, p1, p1], Vec3::Z * s, T_METAL, if k % 4 == 0 { [0.3, 0.31, 0.35, 1.0] } else { chrome });
+    }
+}
+
+/// Skin stretched over a row of cross-sections (`grid[station][point]`), like the panels of a
+/// car body. `smooth` blends the shading across panels so the surface reads as curved;
+/// `pick` gives the texture tile and colour of each panel.
+fn loft(m: &mut MB, grid: &[Vec<Vec3>], smooth: bool, pick: &dyn Fn(usize, usize) -> (u32, [f32; 4])) {
+    let (ni, nj) = (grid.len(), grid[0].len());
+    let cen: Vec<Vec3> = grid.iter().map(|r| r.iter().copied().sum::<Vec3>() / nj as f32).collect();
+    // panel normals, pointing away from the spine of the shape
+    let face_n = |i: usize, j: usize| {
+        let (a, b, c, d) = (grid[i][j], grid[i][j + 1], grid[i + 1][j + 1], grid[i + 1][j]);
+        let n = (c - a).cross(d - b).normalize_or_zero();
+        if n.dot((a + b + c + d) * 0.25 - (cen[i] + cen[i + 1]) * 0.5) < 0.0 { -n } else { n }
+    };
+    let mut vn = vec![vec![Vec3::ZERO; nj]; ni];
+    for i in 0..ni - 1 {
+        for j in 0..nj - 1 {
+            let n = face_n(i, j);
+            for (di, dj) in [(0, 0), (0, 1), (1, 1), (1, 0)] {
+                vn[i + di][j + dj] += n;
+            }
+        }
+    }
+    for i in 0..ni - 1 {
+        for j in 0..nj - 1 {
+            let n = face_n(i, j);
+            let q = [(i, j), (i, j + 1), (i + 1, j + 1), (i + 1, j)];
+            let mut v = q.map(|(a, b)| grid[a][b]);
+            let mut ns = q.map(|(a, b)| if smooth { vn[a][b].normalize_or(n) } else { n });
+            if (v[1] - v[0]).cross(v[3] - v[0]).dot(n) < 0.0 {
+                v.swap(1, 3);
+                ns.swap(1, 3);
+            }
+            let (tile, col) = pick(i, j);
+            m.quad_n(v, ns, tile, col);
+        }
+    }
+}
+
+/// Car body styles: 0 saloon, 1 hatchback, 2 SUV. Built to real proportions (about 4.5 m long,
+/// 1.8 m wide) from a curved lower shell, a glasshouse, round wheels in arches, and trim.
 fn car_mesh(col: [f32; 3], police: bool, style: u32) -> Mesh {
     let mut m = MB::default();
     let body = rgb(col, 1.0);
-    let sill = rgb(col, 0.5);
+    let low = rgb(col, 0.7);
+    let seam = rgb(col, 0.3);
     let trim = [0.05, 0.05, 0.06, 1.0];
     let chrome = [0.75, 0.78, 0.85, 1.0];
     let glass = [0.75, 0.85, 1.0, 1.0];
-    let (len, wid, deck, roof) = match style {
-        2 => (2.35, 1.02, 1.12, 1.92),
-        1 => (2.05, 0.95, 0.98, 1.5),
-        _ => (2.25, 0.96, 0.98, 1.48),
+    let white = [0.92, 0.92, 0.96, 1.0];
+    // half length, half width, sill height, belt line, roof, wheel radius, axle distance from centre
+    let (len, wid, sill, belt, roof, wr, axle) = match style {
+        2 => (2.3f32, 0.94f32, 0.3f32, 1.06f32, 1.74f32, 0.38f32, 1.42f32),
+        1 => (2.02, 0.88, 0.2, 0.92, 1.44, 0.32, 1.28),
+        _ => (2.3, 0.9, 0.2, 0.9, 1.4, 0.33, 1.38),
     };
-    // wheels with hubcaps
-    for x in [-len * 0.62, len * 0.6] {
+    // cabin: front and rear of the glasshouse, rake of windscreen and rear screen
+    let (cab_f, cab_r, ws, rs) = match style {
+        2 => (0.95, -len + 0.1, 0.5, 0.22),
+        1 => (0.7, -len + 0.12, 0.62, 0.42),
+        _ => (0.72, -1.3, 0.66, 0.6),
+    };
+    let nose = belt - if style == 2 { 0.1 } else { 0.16 };
+    let tail = if style == 0 { belt - 0.03 } else { belt };
+
+    // wheels in dark arches
+    for x in [-axle, axle] {
         for s in [-1.0f32, 1.0] {
-            let z = s * (wid + 0.02);
-            m.boxx(Vec3::new(x - 0.4, 0.0, z - 0.14), Vec3::new(x + 0.4, 0.7, z + 0.14), T_TYRE, T_TYRE, WHITE);
-            m.boxx(Vec3::new(x - 0.2, 0.18, z + s * 0.155 - 0.02), Vec3::new(x + 0.2, 0.52, z + s * 0.155 + 0.02), T_METAL, T_METAL, chrome);
+            wheel(&mut m, x, s * (wid - 0.1), s, wr, 0.11);
+            let z = s * (wid + 0.004);
+            let c = Vec3::new(x, wr, z);
+            let ra = wr + 0.08;
+            let arch = [0.3, 0.3, 0.34, 1.0];
+            for k in 0..10 {
+                let p = |k: usize| {
+                    let a = k as f32 / 10.0 * std::f32::consts::PI;
+                    Vec3::new(x + a.cos() * ra, wr + a.sin() * ra, z)
+                };
+                face(&mut m, [c, p(k), p(k + 1), p(k + 1)], Vec3::Z * s, T_TYRE, arch);
+            }
+            face(&mut m, [Vec3::new(x - ra, wr, z), Vec3::new(x - ra, sill, z), Vec3::new(x + ra, sill, z), Vec3::new(x + ra, wr, z)], Vec3::Z * s, T_TYRE, arch);
         }
     }
-    // sills and bumpers
-    m.boxx(Vec3::new(-len, 0.22, -wid), Vec3::new(len, 0.6, wid), T_PAINT, T_PAINT, sill);
-    m.boxx(Vec3::new(-len - 0.1, 0.28, -wid + 0.08), Vec3::new(-len + 0.06, 0.55, wid - 0.08), T_METAL, T_METAL, trim);
-    m.boxx(Vec3::new(len - 0.06, 0.28, -wid + 0.08), Vec3::new(len + 0.1, 0.55, wid - 0.08), T_METAL, T_METAL, trim);
-    // main body: boot, shoulder line, bonnet falling away to the nose
-    let nose = if style == 2 { deck - 0.1 } else { deck - 0.18 };
-    let (cab_f, cab_r) = match style {
-        2 => (len * 0.42, -len + 0.12),
-        1 => (len * 0.3, -len + 0.18),
-        _ => (len * 0.3, -len * 0.55),
-    };
-    section(
-        &mut m,
-        &[(-len, deck - 0.06), (cab_r, deck), (cab_f, deck), (len - 0.25, nose), (len, nose - 0.14)],
-        0.6,
-        wid,
-        wid - 0.05,
-        T_PAINT,
-        T_PAINT,
-        body,
-        body,
-    );
-    // glasshouse: raked windscreen, roof, rear screen; glass flanks
-    let (ws, rs) = match style {
-        2 => (0.45, 0.2),
-        1 => (0.62, 0.45),
-        _ => (0.62, 0.55),
-    };
-    section(
-        &mut m,
-        &[(cab_r, deck), (cab_r + rs, roof), (cab_f - ws, roof), (cab_f, deck)],
-        deck,
-        wid - 0.07,
-        wid - 0.2,
-        T_GLASS,
-        T_GLASS,
-        glass,
-        glass,
-    );
-    // painted roof panel and pillars sit just proud of the glass
-    let roofc = if police { [0.92, 0.92, 0.96, 1.0] } else { body };
-    m.boxx(Vec3::new(cab_r + rs + 0.02, roof - 0.04, -wid + 0.19), Vec3::new(cab_f - ws - 0.02, roof + 0.03, wid - 0.19), T_PAINT, T_PAINT, roofc);
+    // floor pan, so nothing shows through between the wheels
+    m.boxx(Vec3::new(-len + 0.25, 0.15, -wid + 0.14), Vec3::new(len - 0.25, sill + 0.03, wid - 0.14), T_METAL, T_METAL, trim);
+
+    // lower shell: cross-sections from tail to nose (x, underside, top, half width)
+    let stations = [
+        (-len, sill + 0.22, tail - 0.18, wid * 0.78),
+        (-len + 0.07, sill + 0.1, tail - 0.05, wid * 0.93),
+        (-len + 0.3, sill, tail, wid),
+        (-0.2, sill, belt, wid + 0.01),
+        (cab_f, sill, belt, wid),
+        (len - 0.55, sill, nose + 0.07, wid - 0.01),
+        (len - 0.1, sill + 0.1, nose - 0.03, wid * 0.94),
+        (len, sill + 0.22, nose - 0.15, wid * 0.78),
+    ];
+    // shape of each cross-section: rocker, bulging flank, shoulder, crowned top
+    let ring = [(-0.93f32, 0.0f32), (-1.0, 0.35), (-0.99, 0.75), (-0.94, 0.96), (-0.8, 1.0), (0.0, 1.02), (0.8, 1.0), (0.94, 0.96), (0.99, 0.75), (1.0, 0.35), (0.93, 0.0)];
+    let grid: Vec<Vec<Vec3>> = stations
+        .iter()
+        .map(|&(x, y0, y1, w)| ring.iter().map(|&(zf, yf)| Vec3::new(x, y0 + (y1 - y0) * yf, w * zf)).collect())
+        .collect();
+    loft(&mut m, &grid, true, &|_, j| (T_PAINT, if j == 0 || j == 9 { low } else { body }));
+    for (i, out) in [(0usize, -1.0f32), (stations.len() - 1, 1.0)] {
+        for j in 1..ring.len() - 1 {
+            face(&mut m, [grid[i][0], grid[i][j], grid[i][j + 1], grid[i][j + 1]], Vec3::X * out, T_PAINT, low);
+        }
+    }
+
+    // glasshouse: raked windscreen, side windows, rear screen, painted roof and roof rails
+    let roofc = if police { white } else { body };
+    let cab = [
+        (cab_r, belt + 0.03, wid - 0.07),
+        (cab_r + rs, roof, wid - 0.1),
+        (cab_f - ws, roof, wid - 0.1),
+        (cab_f, belt + 0.03, wid - 0.07),
+    ];
+    let cring = [(-1.0f32, 0.0f32), (-0.87, 0.84), (-0.73, 0.99), (0.0, 1.02), (0.73, 0.99), (0.87, 0.84), (1.0, 0.0)];
+    let base = belt - 0.06;
+    let cgrid: Vec<Vec<Vec3>> =
+        cab.iter().map(|&(x, top, w)| cring.iter().map(|&(zf, yf)| Vec3::new(x, base + (top - base) * yf, w * zf)).collect()).collect();
+    loft(&mut m, &cgrid, false, &|i, j| match (i, j) {
+        (1, 0) | (1, 5) => (T_GLASS, glass),
+        (1, 1) | (1, 4) => (T_PAINT, low),
+        (1, _) => (T_PAINT, roofc),
+        _ => (T_GLASS, glass),
+    });
     let mid = (cab_r + rs + cab_f - ws) * 0.5;
+    let top_y = base + (roof - base) * 0.84;
     for s in [-1.0f32, 1.0] {
-        // B-pillar
-        face(
-            &mut m,
-            [Vec3::new(mid - 0.07, roof, s * (wid - 0.19)), Vec3::new(mid - 0.07, deck, s * (wid - 0.06)), Vec3::new(mid + 0.07, deck, s * (wid - 0.06)), Vec3::new(mid + 0.07, roof, s * (wid - 0.19))],
-            Vec3::Z * s,
-            T_PAINT,
-            sill,
-        );
+        // pillars: B in the middle, A and C framing the screens
+        for (x0, x1) in [(mid - 0.06, mid + 0.06), (cab_r + rs - 0.05, cab_r + rs + 0.05), (cab_f - ws - 0.05, cab_f - ws + 0.05)] {
+            let (zb, zt) = (s * (wid - 0.1 + 0.006), s * ((wid - 0.1) * 0.87 + 0.006));
+            face(&mut m, [Vec3::new(x0, top_y, zt), Vec3::new(x0, belt, zb), Vec3::new(x1, belt, zb), Vec3::new(x1, top_y, zt)], Vec3::Z * s, T_PAINT, low);
+        }
+        // door shut lines and handles
+        let zs = s * (wid + 0.013);
+        let mut seams = vec![mid, cab_f - 0.03];
+        if style != 1 {
+            seams.push(cab_r + rs * 0.5 + 0.1);
+        }
+        for x in seams {
+            face(&mut m, [Vec3::new(x - 0.012, belt - 0.04, zs), Vec3::new(x - 0.012, sill + 0.06, zs), Vec3::new(x + 0.012, sill + 0.06, zs), Vec3::new(x + 0.012, belt - 0.04, zs)], Vec3::Z * s, T_PAINT, seam);
+        }
+        for x in [mid - 0.3, mid + 0.42] {
+            let (za, zb) = (s * (wid - 0.01), s * (wid + 0.035));
+            m.boxx(Vec3::new(x, belt - 0.15, za.min(zb)), Vec3::new(x + 0.17, belt - 0.11, za.max(zb)), T_METAL, T_METAL, chrome);
+        }
         // door mirrors
-        let (za, zb) = (s * wid, s * (wid + 0.24));
-        m.boxx(Vec3::new(cab_f - 0.18, deck - 0.02, za.min(zb)), Vec3::new(cab_f + 0.02, deck + 0.14, za.max(zb)), T_PAINT, T_PAINT, sill);
+        let (za, zb) = (s * (wid - 0.04), s * (wid + 0.2));
+        m.boxx(Vec3::new(cab_f - 0.14, belt - 0.01, za.min(zb)), Vec3::new(cab_f + 0.03, belt + 0.12, za.max(zb)), T_PAINT, T_PAINT, low);
+        // lamp clusters wrapped round the corners
+        let (z0, z1) = if s < 0.0 { (-wid * 0.82, -wid * 0.36) } else { (wid * 0.36, wid * 0.82) };
+        m.boxx(Vec3::new(len - 0.2, nose - 0.34, z0), Vec3::new(len + 0.015, nose - 0.17, z1), T_HEADLIGHT, T_HEADLIGHT, WHITE);
+        m.boxx(Vec3::new(-len - 0.015, tail - 0.37, z0), Vec3::new(-len + 0.2, tail - 0.2, z1), T_TAILLIGHT, T_TAILLIGHT, WHITE);
     }
-    // lamps, grille, plates
-    for s in [-1.0f32, 1.0] {
-        let (z0, z1) = if s < 0.0 { (-wid + 0.06, -wid + 0.5) } else { (wid - 0.5, wid - 0.06) };
-        m.boxx(Vec3::new(len - 0.12, nose - 0.36, z0), Vec3::new(len + 0.04, nose - 0.12, z1), T_HEADLIGHT, T_HEADLIGHT, WHITE);
-        m.boxx(Vec3::new(-len - 0.04, deck - 0.36, z0), Vec3::new(-len + 0.1, deck - 0.1, z1), T_TAILLIGHT, T_TAILLIGHT, WHITE);
-    }
-    m.boxx(Vec3::new(len - 0.02, nose - 0.4, -0.4), Vec3::new(len + 0.05, nose - 0.2, 0.4), T_METAL, T_METAL, trim);
-    m.boxx(Vec3::new(-len - 0.06, 0.6, -0.28), Vec3::new(-len + 0.02, 0.78, 0.28), T_WHITE, T_WHITE, [0.85, 0.85, 0.8, 1.0]);
+    // grille, bumpers, number plates
+    m.boxx(Vec3::new(len - 0.05, sill + 0.24, -wid * 0.34), Vec3::new(len + 0.02, nose - 0.19, wid * 0.34), T_METAL, T_METAL, trim);
+    m.boxx(Vec3::new(len - 0.16, sill + 0.06, -wid * 0.84), Vec3::new(len + 0.05, sill + 0.24, wid * 0.84), T_METAL, T_METAL, trim);
+    m.boxx(Vec3::new(-len - 0.05, sill + 0.06, -wid * 0.84), Vec3::new(-len + 0.16, sill + 0.24, wid * 0.84), T_METAL, T_METAL, trim);
+    m.boxx(Vec3::new(len + 0.05, sill + 0.09, -0.26), Vec3::new(len + 0.06, sill + 0.21, 0.26), T_WHITE, T_WHITE, [0.85, 0.85, 0.8, 1.0]);
+    m.boxx(Vec3::new(-len - 0.06, sill + 0.09, -0.26), Vec3::new(-len - 0.05, sill + 0.21, 0.26), T_WHITE, T_WHITE, [0.85, 0.85, 0.8, 1.0]);
     if style == 2 {
         // roof rails
         for s in [-1.0f32, 1.0] {
-            m.boxx(Vec3::new(cab_r + 0.5, roof + 0.03, s * (wid - 0.3) - 0.03), Vec3::new(cab_f - 0.7, roof + 0.1, s * (wid - 0.3) + 0.03), T_METAL, T_METAL, chrome);
+            let z = s * (wid - 0.1) * 0.7;
+            m.boxx(Vec3::new(cab_r + 0.5, roof, z - 0.03), Vec3::new(cab_f - 0.7, roof + 0.08, z + 0.03), T_METAL, T_METAL, chrome);
         }
     }
     if police {
-        m.boxx(Vec3::new(mid - 0.18, roof + 0.03, -0.62), Vec3::new(mid + 0.18, roof + 0.22, 0.62), T_POLICE, T_POLICE, WHITE);
-        // white doors and bonnet stripe
+        m.boxx(Vec3::new(mid - 0.16, roof, -0.55), Vec3::new(mid + 0.16, roof + 0.2, 0.55), T_POLICE, T_POLICE, WHITE);
+        // white doors
         for s in [-1.0f32, 1.0] {
-            face(
-                &mut m,
-                [Vec3::new(cab_r + 0.2, deck - 0.03, s * (wid + 0.005)), Vec3::new(cab_r + 0.2, 0.62, s * (wid + 0.005)), Vec3::new(cab_f - 0.1, 0.62, s * (wid + 0.005)), Vec3::new(cab_f - 0.1, deck - 0.03, s * (wid + 0.005))],
-                Vec3::Z * s,
-                T_PAINT,
-                [0.92, 0.92, 0.96, 1.0],
-            );
+            let z = s * (wid + 0.011);
+            face(&mut m, [Vec3::new(cab_r + 0.3, belt - 0.05, z), Vec3::new(cab_r + 0.3, sill + 0.1, z), Vec3::new(cab_f - 0.06, sill + 0.1, z), Vec3::new(cab_f - 0.06, belt - 0.05, z)], Vec3::Z * s, T_PAINT, white);
         }
     }
     m.build()
+}
+
+/// Rounded clump of foliage: a slightly lumpy ball, darker underneath where the light does not reach.
+fn blob(m: &mut MB, c: Vec3, rx: f32, ry: f32, seed: u32, tile: u32, col: [f32; 3]) {
+    const SEG: usize = 8;
+    const RING: usize = 5;
+    let grid: Vec<Vec<Vec3>> = (0..=RING)
+        .map(|i| {
+            // from a little below the middle up to the crown
+            let lat = -1.0 + (i as f32 / RING as f32) * 2.55;
+            (0..=SEG)
+                .map(|j| {
+                    let lon = j as f32 / SEG as f32 * std::f32::consts::TAU;
+                    let lump = 0.86 + 0.28 * hf((j % SEG) as i32, i as i32, seed);
+                    let pole = if i == RING { 0.05 } else { 1.0 };
+                    let rr = rx * lat.cos().max(0.0) * lump * pole + 0.02;
+                    c + Vec3::new(lon.cos() * rr, lat.sin() * ry * if i == RING { 1.0 } else { lump }, lon.sin() * rr)
+                })
+                .collect()
+        })
+        .collect();
+    loft(m, &grid, true, &|i, j| {
+        let k = 0.5 + 0.17 * i as f32 + 0.1 * hf(i as i32, j as i32, seed + 7);
+        (tile, rgb(col, k))
+    });
+}
+
+/// A tree at `p` (the builder's `lift` is the ground height there). `s` picks size and species:
+/// broad-leaved trees with clumped crowns, spruces, and white-stemmed birches.
+pub fn add_tree(m: &mut MB, p: Vec2, s: u8) {
+    let k = s as f32 / 255.0;
+    let seed = s as u32 * 31 + (p.x as i32 as u32 & 255);
+    let tone = 0.78 + ((s as u32 * 37) % 100) as f32 * 0.005;
+    let rot = k * 6.0;
+    let at = |dx: f32, y: f32, dz: f32| Vec3::new(p.x + dx, y, p.y + dz);
+    match s % 6 {
+        0 => {
+            // spruce: tiers of drooping branches narrowing to a point
+            let h = 8.0 + k * 5.0;
+            let r = 2.0 + k * 1.0;
+            m.prism(p, 0.26, 0.16, 0.0, h * 0.35, 6, rot, T_METAL, T_METAL, [0.34, 0.22, 0.16, 1.0]);
+            let tiers = 5;
+            for t in 0..tiers {
+                let f = t as f32 / tiers as f32;
+                let (y0, y1) = (h * (0.14 + 0.72 * f), h * (0.14 + 0.72 * f) + h * 0.3);
+                let rr = r * (1.0 - 0.78 * f);
+                let g = tone * (0.62 + 0.14 * t as f32);
+                m.prism(p, rr, rr * 0.12, y0, y1.min(h), 9, rot + t as f32 * 0.4, T_LEAF + 1, T_LEAF + 1, [0.42 * g, 0.62 * g, 0.5 * g, 1.0]);
+            }
+        }
+        1 => {
+            // birch: slender white stem, light airy crown
+            let h = 6.5 + k * 3.5;
+            m.prism(p, 0.17, 0.1, 0.0, h, 6, rot, T_WHITE, T_WHITE, [0.86, 0.86, 0.8, 1.0]);
+            for j in 0..3 {
+                m.prism(p, 0.175, 0.17, h * (0.18 + 0.2 * j as f32), h * (0.18 + 0.2 * j as f32) + 0.18, 6, rot, T_WHITE, T_WHITE, [0.12, 0.12, 0.12, 1.0]);
+            }
+            let r = 1.3 + k * 0.8;
+            let c = [0.95 * tone, 1.12 * tone, 0.6 * tone];
+            blob(m, at(0.0, h * 0.82, 0.0), r, r * 1.25, seed, T_LEAF, c);
+            let o = Vec2::from_angle(rot) * r * 0.6;
+            blob(m, at(o.x, h * 0.62, o.y), r * 0.7, r * 0.8, seed + 3, T_LEAF, c);
+            blob(m, at(-o.y * 0.9, h * 0.7, o.x * 0.9), r * 0.62, r * 0.7, seed + 5, T_LEAF, c);
+        }
+        _ => {
+            // lime, maple, oak: stout trunk forking into boughs, crown of several clumps
+            let h = 3.4 + k * 3.2;
+            let r = 1.9 + k * 1.7;
+            let bark = [0.33, 0.23, 0.17, 1.0];
+            m.prism(p, 0.42, 0.26, 0.0, h, 7, rot, T_METAL, T_METAL, bark);
+            m.prism(p, 0.6, 0.42, -0.3, 0.5, 7, rot, T_METAL, T_METAL, bark); // root flare
+            let leaf = if s % 7 == 0 { T_LEAF + 1 } else { T_LEAF };
+            let warm = (s % 5) as f32 * 0.04;
+            let c = [(0.78 + warm) * tone, 1.0 * tone, (0.72 - warm) * tone];
+            blob(m, at(0.0, h + r * 0.75, 0.0), r, r * 0.9, seed, leaf, c);
+            for j in 0..3 {
+                let a = rot + j as f32 * 2.1 + 0.4;
+                let o = Vec2::from_angle(a) * r * 0.72;
+                let rr = r * (0.56 + 0.1 * hf(j, s as i32, 5));
+                // a bough reaching out to each clump
+                m.quad(
+                    [Vec3::new(p.x - 0.12, h * 0.8, p.y), Vec3::new(p.x + 0.12, h * 0.8, p.y), Vec3::new(p.x + o.x + 0.06, h + r * 0.35, p.y + o.y), Vec3::new(p.x + o.x - 0.06, h + r * 0.35, p.y + o.y)],
+                    T_METAL,
+                    0,
+                    bark,
+                );
+                blob(m, at(o.x, h + r * (0.42 + 0.14 * j as f32), o.y), rr, rr * 0.85, seed + 11 * (j as u32 + 1), leaf, [c[0] * (0.92 + 0.07 * j as f32), c[1] * (0.92 + 0.07 * j as f32), c[2]]);
+            }
+        }
+    }
+}
+
+/// A parked narrow-body airliner (about 37 m long, 34 m span) at `pos`, nose towards `heading`,
+/// wheels on the ground at height `y`.
+pub fn add_plane(m: &mut MB, pos: Vec2, heading: f32, y: f32, livery: usize) {
+    let f = Vec2::from_angle(heading);
+    let r = Vec2::new(-f.y, f.x);
+    // local (forward, up, right) -> world
+    let w = |x: f32, h: f32, z: f32| {
+        let p = pos + f * x + r * z;
+        Vec3::new(p.x, y + h, p.y)
+    };
+    let white = [0.9, 0.91, 0.94, 1.0];
+    let belly = [0.55, 0.57, 0.62, 1.0];
+    let accent = rgb(NEON[livery % 8], 0.75);
+    let grey = [0.5, 0.52, 0.56, 1.0];
+    let dark = [0.07, 0.07, 0.09, 1.0];
+    // a tube of `n` sides around a centre line of (x, height, radius) stations, offset sideways by `z`
+    let tube = |m: &mut MB, st: &[(f32, f32, f32)], z: f32, n: usize, pick: &dyn Fn(usize, usize) -> (u32, [f32; 4])| {
+        let grid: Vec<Vec<Vec3>> = st
+            .iter()
+            .map(|&(x, h, rad)| {
+                (0..=n)
+                    .map(|k| {
+                        let a = k as f32 / n as f32 * std::f32::consts::TAU;
+                        w(x, h + a.cos() * rad, z + a.sin() * rad)
+                    })
+                    .collect()
+            })
+            .collect();
+        loft(m, &grid, true, pick);
+    };
+    // fuselage: pointed nose, constant section, tail cone sweeping up
+    let cy = 3.5;
+    let body = [
+        (18.8, cy - 0.5, 0.05),
+        (18.2, cy - 0.35, 0.7),
+        (17.0, cy - 0.1, 1.45),
+        (15.0, cy, 1.95),
+        (-6.0, cy, 1.95),
+        (-12.0, cy + 0.35, 1.5),
+        (-16.5, cy + 0.9, 0.75),
+        (-18.8, cy + 1.2, 0.2),
+    ];
+    // k = 0 is the top of the tube; the lower third is grey, a cheat line of windows runs along the side
+    tube(m, &body, 0.0, 14, &|i, k| {
+        let side = k == 3 || k == 10;
+        if i == 2 && (k == 0 || k == 13) {
+            (T_GLASS, [0.5, 0.6, 0.8, 1.0]) // flight deck windows
+        } else if side && (3..5).contains(&i) {
+            (T_GLASS, [0.35, 0.4, 0.5, 1.0])
+        } else if (5..9).contains(&k) {
+            (T_WHITE, belly)
+        } else {
+            (T_WHITE, white)
+        }
+    });
+    // flat surfaces: top and underside of a wing, tailplane or fin, given its four corners
+    let slab = |m: &mut MB, q: [Vec3; 4], col: [f32; 4], out: Vec3| {
+        let n = (q[1] - q[0]).cross(q[3] - q[0]);
+        let q2 = if n.dot(out) < 0.0 { [q[0], q[3], q[2], q[1]] } else { q };
+        m.quad(q2, T_WHITE, 0, col);
+        m.quad([q2[0], q2[3], q2[2], q2[1]], T_WHITE, 0, [col[0] * 0.6, col[1] * 0.6, col[2] * 0.6, 1.0]);
+    };
+    for s in [-1.0f32, 1.0] {
+        // swept wing with a little dihedral, winglet at the tip
+        slab(m, [w(4.5, cy - 1.0, s * 1.6), w(-2.2, cy - 1.0, s * 1.6), w(-7.6, cy - 0.1, s * 17.0), w(-6.0, cy - 0.1, s * 17.0)], grey, Vec3::Y);
+        slab(m, [w(-6.0, cy - 0.1, s * 17.0), w(-7.6, cy - 0.1, s * 17.0), w(-8.6, cy + 1.9, s * 17.3), w(-7.6, cy + 1.9, s * 17.3)], accent, Vec3::new(r.x, 0.0, r.y) * s);
+        // tailplane
+        slab(m, [w(-13.6, cy + 0.9, s * 0.8), w(-16.6, cy + 0.9, s * 0.8), w(-18.6, cy + 1.2, s * 6.2), w(-17.4, cy + 1.2, s * 6.2)], grey, Vec3::Y);
+        // engine under the wing on a pylon
+        let (ez, eh) = (s * 5.6, cy - 2.0);
+        tube(m, &[(5.2, eh, 0.95), (4.6, eh, 1.1), (1.6, eh, 1.05), (0.6, eh, 0.6)], ez, 10, &|_, _| (T_WHITE, white));
+        tube(m, &[(5.25, eh, 0.9), (5.2, eh, 0.05)], ez, 10, &|_, _| (T_WHITE, dark));
+        slab(m, [w(3.6, cy - 0.9, ez), w(1.2, cy - 0.9, ez), w(1.2, eh + 0.9, ez), w(3.6, eh + 0.9, ez)], grey, Vec3::new(r.x, 0.0, r.y) * s);
+        // main landing gear
+        let (gx, gz) = (-1.6, s * 3.6);
+        m.quad([w(gx - 0.12, cy - 1.0, gz), w(gx - 0.12, 0.5, gz), w(gx + 0.12, 0.5, gz), w(gx + 0.12, cy - 1.0, gz)], T_METAL, 0, grey);
+        m.quad([w(gx + 0.12, cy - 1.0, gz), w(gx + 0.12, 0.5, gz), w(gx - 0.12, 0.5, gz), w(gx - 0.12, cy - 1.0, gz)], T_METAL, 0, grey);
+        tube(m, &[(gx, 0.55, 0.05), (gx, 0.55, 0.55)], gz - 0.3, 10, &|_, _| (T_TYRE, WHITE));
+        tube(m, &[(gx, 0.55, 0.55), (gx, 0.55, 0.05)], gz + 0.3, 10, &|_, _| (T_TYRE, WHITE));
+    }
+    // fin in the airline's colour, nose gear
+    let side = Vec3::new(r.x, 0.0, r.y);
+    slab(m, [w(-11.8, cy + 1.6, 0.0), w(-17.6, cy + 1.7, 0.0), w(-19.2, cy + 8.2, 0.0), w(-16.6, cy + 8.2, 0.0)], accent, side);
+    m.quad([w(13.4, cy - 1.6, -0.1), w(13.4, 0.4, -0.1), w(13.4, 0.4, 0.1), w(13.4, cy - 1.6, 0.1)], T_METAL, 0, grey);
+    tube(m, &[(13.4, 0.42, 0.05), (13.4, 0.42, 0.42)], -0.2, 8, &|_, _| (T_TYRE, WHITE));
+    tube(m, &[(13.4, 0.42, 0.42), (13.4, 0.42, 0.05)], 0.2, 8, &|_, _| (T_TYRE, WHITE));
 }
 
 /// A 12 m city bus / trolleybus with its route number in lights on the roof.
@@ -1029,8 +1501,8 @@ pub fn bus_mesh(name: &str, kind: u8) -> Mesh {
     };
     let (l, w) = (6.0, 1.28);
     for x in [-3.9f32, 3.6] {
-        for z in [-w, w] {
-            m.boxx(Vec3::new(x - 0.5, 0.0, z - 0.18), Vec3::new(x + 0.5, 0.95, z + 0.18), T_TYRE, T_TYRE, WHITE);
+        for sd in [-1.0f32, 1.0] {
+            wheel(&mut m, x, sd * (w - 0.12), sd, 0.5, 0.18);
         }
     }
     m.boxx(Vec3::new(-l, 0.35, -w), Vec3::new(l, 1.45, w), T_PAINT, T_PAINT, body);
@@ -1076,34 +1548,49 @@ pub fn bus_mesh(name: &str, kind: u8) -> Mesh {
     m.build()
 }
 
-/// A person, 1.8 m tall, facing +x. `frame` 0/1 are the two halves of a walking stride.
+/// A person, 1.8 m tall, facing +x. Frames 0..4 are one walking cycle: left foot forward,
+/// passing (right knee lifted), right foot forward, passing (left knee lifted).
 fn ped_mesh(cloth: [f32; 3], head: [f32; 3], frame: u32) -> Mesh {
     let mut m = MB::default();
-    let s = if frame == 0 { 1.0 } else { -1.0 };
+    let (s, lifted) = match frame {
+        0 => (1.0f32, 9usize),
+        1 => (0.0, 1),
+        2 => (-1.0, 9),
+        3 => (0.0, 0),
+        _ => (1e-6, 9), // standing
+    };
+    // the body rises as the legs pass under it
+    let b = if s == 0.0 { 0.04 } else { 0.0 };
     let top = rgb(cloth, 1.0);
     let dark = rgb(cloth, 0.55);
     let legs = [0.07 + cloth[2] * 0.15, 0.08 + cloth[0] * 0.1, 0.12 + cloth[1] * 0.12, 1.0];
     let skin = [0.62, 0.44, 0.34, 1.0];
     let hair = rgb(head, 0.8);
-    // legs and shoes, one forward one back
-    for (side, fwd) in [(-1.0f32, s), (1.0, -s)] {
-        let (z, x) = (side * 0.13, fwd * 0.2);
-        m.boxx(Vec3::new(x - 0.1, 0.1, z - 0.09), Vec3::new(x + 0.1, 0.92, z + 0.09), T_WHITE, T_WHITE, legs);
-        m.boxx(Vec3::new(x - 0.1, 0.0, z - 0.1), Vec3::new(x + 0.2, 0.1, z + 0.1), T_WHITE, T_WHITE, [0.05, 0.05, 0.06, 1.0]);
+    let shoe = [0.05, 0.05, 0.06, 1.0];
+    // legs: thigh, shin and shoe, so a stride reads as a bent limb rather than a sliding post
+    for (i, (side, fwd)) in [(-1.0f32, s), (1.0, -s)].into_iter().enumerate() {
+        let (z, x) = (side * 0.13, fwd * 0.26);
+        let up = if lifted == i { 0.14 } else { 0.0 };
+        let knee = if lifted == i { 0.12 } else { x * 0.45 };
+        let foot = if lifted == i { -0.06 } else { x };
+        m.boxx(Vec3::new(knee - 0.1, 0.5, z - 0.09), Vec3::new(knee + 0.1, 0.94 + b, z + 0.09), T_WHITE, T_WHITE, legs);
+        m.boxx(Vec3::new(foot - 0.09, 0.08 + up, z - 0.085), Vec3::new(foot + 0.09, 0.54 + up * 0.4, z + 0.085), T_WHITE, T_WHITE, legs);
+        m.boxx(Vec3::new(foot - 0.1, up, z - 0.1), Vec3::new(foot + 0.2, 0.1 + up, z + 0.1), T_WHITE, T_WHITE, shoe);
     }
     // torso, shoulders
-    m.boxx(Vec3::new(-0.15, 0.9, -0.25), Vec3::new(0.15, 1.5, 0.25), T_WHITE, T_WHITE, top);
-    m.boxx(Vec3::new(-0.13, 1.42, -0.34), Vec3::new(0.13, 1.54, 0.34), T_WHITE, T_WHITE, top);
-    // arms swing opposite to the legs, hands at the ends
+    m.boxx(Vec3::new(-0.15, 0.9 + b, -0.25), Vec3::new(0.15, 1.5 + b, 0.25), T_WHITE, T_WHITE, top);
+    m.boxx(Vec3::new(-0.13, 1.42 + b, -0.34), Vec3::new(0.13, 1.54 + b, 0.34), T_WHITE, T_WHITE, top);
+    // arms swing opposite to the legs: upper arm, forearm, hand
     for (side, fwd) in [(-1.0f32, -s), (1.0, s)] {
-        let (z, x) = (side * 0.33, fwd * 0.16);
-        m.boxx(Vec3::new(x - 0.07, 0.95, z - 0.07), Vec3::new(x + 0.07, 1.46, z + 0.07), T_WHITE, T_WHITE, dark);
-        m.boxx(Vec3::new(x - 0.06, 0.85, z - 0.06), Vec3::new(x + 0.06, 0.95, z + 0.06), T_WHITE, T_WHITE, skin);
+        let (z, x) = (side * 0.33, fwd * 0.2);
+        m.boxx(Vec3::new(x * 0.4 - 0.07, 1.18 + b, z - 0.07), Vec3::new(x * 0.4 + 0.07, 1.46 + b, z + 0.07), T_WHITE, T_WHITE, dark);
+        m.boxx(Vec3::new(x - 0.065, 0.95 + b, z - 0.065), Vec3::new(x + 0.065, 1.2 + b, z + 0.065), T_WHITE, T_WHITE, dark);
+        m.boxx(Vec3::new(x - 0.06, 0.85 + b, z - 0.06), Vec3::new(x + 0.06, 0.95 + b, z + 0.06), T_WHITE, T_WHITE, skin);
     }
-    // neck, head, hair, a hint of a face
-    m.boxx(Vec3::new(-0.06, 1.5, -0.07), Vec3::new(0.06, 1.58, 0.07), T_WHITE, T_WHITE, skin);
-    m.boxx(Vec3::new(-0.13, 1.56, -0.13), Vec3::new(0.13, 1.82, 0.13), T_WHITE, T_WHITE, skin);
-    m.boxx(Vec3::new(-0.15, 1.74, -0.15), Vec3::new(0.1, 1.86, 0.15), T_WHITE, T_WHITE, hair);
+    // neck, head, hair
+    m.boxx(Vec3::new(-0.06, 1.5 + b, -0.07), Vec3::new(0.06, 1.58 + b, 0.07), T_WHITE, T_WHITE, skin);
+    m.boxx(Vec3::new(-0.13, 1.56 + b, -0.13), Vec3::new(0.13, 1.82 + b, 0.13), T_WHITE, T_WHITE, skin);
+    m.boxx(Vec3::new(-0.15, 1.74 + b, -0.15), Vec3::new(0.1, 1.86 + b, 0.15), T_WHITE, T_WHITE, hair);
     m.build()
 }
 
@@ -1117,6 +1604,7 @@ pub fn setup_art(
     mut commands: Commands,
     mut images: ResMut<Assets<Image>>,
     mut mats: ResMut<Assets<StandardMaterial>>,
+    mut waters: ResMut<Assets<WaterMaterial>>,
     mut meshes: ResMut<Assets<Mesh>>,
 ) {
     let atlas = build_atlas();
@@ -1148,6 +1636,7 @@ pub fn setup_art(
             let (b, m) = tiled_images(k);
             mats.add(StandardMaterial {
                 base_color_texture: Some(images.add(b)),
+                normal_map_texture: (k == M_WATER).then(|| images.add(water_normal())),
                 metallic_roughness_texture: Some(images.add(m)),
                 perceptual_roughness: 1.0,
                 metallic: 1.0,
@@ -1156,9 +1645,12 @@ pub fn setup_art(
         })
         .collect();
 
+    let water = waters.add(WaterMaterial {
+        p: WaterParams { deep: Vec4::new(0.05, 0.14, 0.15, 0.0), flow: Vec4::new(-0.95, 0.3, 0.0, 0.0), ..default() },
+    });
     let (db, dm) = tiled_images(M_ASPHALT);
     let deck = mats.add(StandardMaterial {
-        base_color: Color::linear_rgb(1.12, 1.12, 1.2),
+        base_color: Color::linear_rgb(1.0, 1.0, 1.0), // same tone as the road on the ground, so ramps blend in
         base_color_texture: Some(images.add(db)),
         metallic_roughness_texture: Some(images.add(dm)),
         perceptual_roughness: 1.0,
@@ -1177,8 +1669,13 @@ pub fn setup_art(
 
     // headlight beams + tail glow
     let mut cg = MB::default();
-    cg.ground(2.0, -4.0, 16.0, 4.0, 0.12, T_CONE, 0, [1.0, 0.92, 0.7, 1.0]);
-    cg.ground(-4.2, -1.8, -1.6, 1.8, 0.12, T_GLOW, 0, [0.5, 0.03, 0.02, 1.0]);
+    // one narrow beam from each headlamp, overlapping into a brighter core down the middle,
+    // a small hot spot at each lamp, and two soft red tail lamps
+    for z in [-0.6f32, 0.6] {
+        cg.ground(2.2, z - 2.3, 21.0, z + 2.3, 0.12, T_CONE, 0, [0.55, 0.52, 0.42, 1.0]);
+        cg.ground(1.9, z - 0.5, 2.9, z + 0.5, 0.75, T_GLOW, 0, [0.9, 0.85, 0.7, 1.0]);
+        cg.ground(-3.6, z - 0.75, -2.1, z + 0.75, 0.12, T_GLOW, 0, [0.45, 0.02, 0.015, 1.0]);
+    }
     let car_glow = meshes.add(cg.build());
     let mut pg = MB::default();
     pg.ground(0.3, -3.2, 6.7, 3.2, 1.9, T_GLOW, 0, [0.8, 0.03, 0.03, 1.0]);
@@ -1199,9 +1696,9 @@ pub fn setup_art(
     let peds = cloths
         .iter()
         .enumerate()
-        .map(|(i, c)| [meshes.add(ped_mesh(*c, heads[i % 4], 0)), meshes.add(ped_mesh(*c, heads[i % 4], 1))])
+        .map(|(i, c)| [0, 1, 2, 3, 4].map(|f| meshes.add(ped_mesh(*c, heads[i % 4], f))))
         .collect();
-    let player = [meshes.add(ped_mesh([0.0, 0.75, 0.9], [0.9, 0.9, 0.95], 0)), meshes.add(ped_mesh([0.0, 0.75, 0.9], [0.9, 0.9, 0.95], 1))];
+    let player = [0, 1, 2, 3, 4].map(|f| meshes.add(ped_mesh([0.0, 0.75, 0.9], [0.9, 0.9, 0.95], f)));
 
     let mut b = MB::default();
     b.ground(-1.4, -0.14, 1.4, 0.14, 0.0, T_SOLID, 0, [1.0, 0.85, 0.4, 1.0]);
@@ -1238,6 +1735,7 @@ pub fn setup_art(
         mat,
         glow,
         tiled,
+        water,
         deck,
         shade,
         cars,

@@ -62,6 +62,15 @@ city map so hills and valleys read at a glance, and the HUD shows your altitude.
 built on that terrain at true scale: ground, roads, buildings, bridges, vehicles, people and the
 camera all follow the real hills and valleys (driving physics itself ignores slope).
 
+## Airport and landmarks
+
+`tools/build_extras.py` turns `data/landmarks_osm.json` (OpenStreetMap `aeroway` features and a few
+building footprints) into `data/extras.bin`, which is embedded in the game: Vilnius airport's runway,
+taxiways, apron and stands with parked airliners, and hand-modelled landmarks on their real
+footprints (Cathedral and bell tower, Gediminas' Tower, Three Crosses, TV Tower, Europa Tower,
+St. Anne's, St. Peter and St. Paul's, Town Hall, Gate of Dawn, Opera, Palace of the Grand Dukes).
+Tall ones are scaled down to stay below the overhead camera.
+
 ## How the map works
 
 - `data/core.bin` (embedded in the binary): the drivable road graph, street names, rivers, tile index.

@@ -145,6 +145,218 @@ pub struct MapUi {
     line: Option<Entity>,
 }
 
+/// Every street address in the city (see `tools/build_addresses.py`).
+static ADDRESSES: &[u8] = include_bytes!("../data/addresses.bin");
+
+/// Address search on the city map: streets (sorted by name) with their house numbers.
+#[derive(Resource)]
+pub struct Search {
+    streets: Vec<(String, Vec<(String, Vec2)>)>,
+    active: bool,
+    query: String,
+    results: Vec<(String, Vec2)>,
+    sel: usize,
+    shown: String,
+}
+
+impl Search {
+    pub fn load() -> Search {
+        let d = ADDRESSES;
+        let mut streets = vec![];
+        if d.len() > 6 && &d[0..4] == b"VLA1" {
+            let mut o = 4;
+            let u16_ = |o: &mut usize| {
+                *o += 2;
+                u16::from_le_bytes([d[*o - 2], d[*o - 1]])
+            };
+            let text = |o: &mut usize| {
+                let n = d[*o] as usize;
+                *o += 1 + n;
+                String::from_utf8_lossy(&d[*o - n..*o]).into_owned()
+            };
+            for _ in 0..u16_(&mut o) {
+                let name = text(&mut o);
+                let n = u16_(&mut o);
+                let list = (0..n)
+                    .map(|_| {
+                        let num = text(&mut o);
+                        let x = u16_(&mut o) as i16 as f32;
+                        (num, Vec2::new(x, u16_(&mut o) as i16 as f32))
+                    })
+                    .collect();
+                streets.push((name, list));
+            }
+        }
+        Search { streets, active: false, query: String::new(), results: vec![], sel: 0, shown: String::new() }
+    }
+
+    /// Up to eight matches for what has been typed: "street" or "street number".
+    fn find(&mut self) {
+        self.results.clear();
+        self.sel = 0;
+        let mut words: Vec<&str> = self.query.split_whitespace().collect();
+        // a last word starting with a digit is the house number
+        let num = if words.len() > 1 && words[words.len() - 1].starts_with(|c: char| c.is_ascii_digit()) { words.pop() } else { None };
+        if words.is_empty() {
+            return;
+        }
+        let street = words.join(" ");
+        // best first: name starts with the text, then every word found at the start of a word, then anywhere
+        let mut hits: Vec<(u8, usize)> = vec![];
+        for (i, (name, _)) in self.streets.iter().enumerate() {
+            let rank = if name.starts_with(&street) {
+                0
+            } else if words.iter().all(|w| name.split(' ').any(|n| n.starts_with(w))) {
+                1
+            } else if words.iter().all(|w| name.contains(w)) {
+                2
+            } else {
+                continue;
+            };
+            hits.push((rank, i));
+        }
+        hits.sort();
+        for (_, i) in hits {
+            let (name, list) = &self.streets[i];
+            match num {
+                Some(n) => {
+                    // the exact number first, then those that begin with it
+                    for exact in [true, false] {
+                        for (hn, p) in list.iter().filter(|(hn, _)| if exact { hn == n } else { hn != n && hn.starts_with(n) }) {
+                            if self.results.len() < 8 {
+                                self.results.push((format!("{name} {hn}"), *p));
+                            }
+                        }
+                    }
+                }
+                None => {
+                    if let Some((_, p)) = list.get(list.len() / 2) {
+                        self.results.push((format!("{name}   ({} addresses)", list.len()), *p));
+                    }
+                }
+            }
+            if self.results.len() >= 8 {
+                break;
+            }
+        }
+    }
+}
+
+/// Upper case without Lithuanian diacritics, the way street names are stored.
+fn plain(c: char) -> Option<char> {
+    let c = c.to_uppercase().next()?;
+    Some(match c {
+        'Ą' => 'A',
+        'Č' => 'C',
+        'Ę' | 'Ė' => 'E',
+        'Į' => 'I',
+        'Š' => 'S',
+        'Ų' | 'Ū' => 'U',
+        'Ž' => 'Z',
+        c if c.is_ascii_alphanumeric() || c == ' ' || c == '.' || c == '-' => c,
+        _ => return None,
+    })
+}
+
+/// Typing an address on the city map: / or Enter starts, arrows pick, Enter goes, Esc cancels.
+/// While typing, no other part of the game sees the keyboard.
+pub fn map_search(
+    mut typed: MessageReader<bevy::input::keyboard::KeyboardInput>,
+    mut keys: ResMut<ButtonInput<KeyCode>>,
+    city: Res<City>,
+    mut game: ResMut<Game>,
+    mut search: ResMut<Search>,
+    mut ui: ResMut<MapUi>,
+    mut label: Single<&mut Text, With<SearchLabel>>,
+) {
+    use bevy::input::ButtonState;
+    use bevy::input::keyboard::Key;
+    let search = &mut *search;
+    if !game.map_view {
+        search.active = false;
+        typed.clear();
+        return;
+    }
+    let mut changed = false;
+    let mut go = false;
+    for ev in typed.read() {
+        if ev.state != ButtonState::Pressed {
+            continue;
+        }
+        if !search.active {
+            if matches!(ev.key_code, KeyCode::Slash | KeyCode::Enter | KeyCode::NumpadEnter) {
+                search.active = true;
+                search.query.clear();
+                search.results.clear();
+                keys.reset_all();
+            }
+            continue;
+        }
+        match &ev.logical_key {
+            Key::Escape => search.active = false,
+            Key::Enter => go = true,
+            Key::Backspace => {
+                search.query.pop();
+                changed = true;
+            }
+            Key::ArrowDown => search.sel = (search.sel + 1).min(search.results.len().saturating_sub(1)),
+            Key::ArrowUp => search.sel = search.sel.saturating_sub(1),
+            Key::Space => {
+                search.query.push(' ');
+                changed = true;
+            }
+            _ => {
+                if let Some(t) = &ev.text {
+                    for c in t.chars().filter_map(plain) {
+                        if search.query.len() < 40 {
+                            search.query.push(c);
+                            changed = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if search.active {
+        keys.reset_all();
+    }
+    if changed {
+        search.find();
+    }
+    if go {
+        if let Some((name, p)) = search.results.get(search.sel).cloned() {
+            // mark it, route to it, and show it
+            game.dest = Some(city.nearest_drive(p).map_or(p, |x| if x.1.distance(p) < 120.0 { x.1 } else { p }));
+            game.route.clear();
+            ui.route_t = 0.0;
+            ui.center = p;
+            ui.mpp = ui.mpp.min(2.0);
+            ui.dirty = true;
+            let name = name.split("   (").next().unwrap_or("").to_string();
+            game.say(&format!("DESTINATION: {name}"), 3.0);
+            search.active = false;
+        }
+    }
+    let txt = if search.active {
+        let mut t = format!("SEARCH: {}_", search.query);
+        for (i, (name, _)) in search.results.iter().enumerate() {
+            t += &format!("\n{} {}", if i == search.sel { ">" } else { " " }, name);
+        }
+        if search.results.is_empty() && search.query.len() > 1 {
+            t += "\n  nothing found";
+        }
+        t
+    } else {
+        "/ SEARCH ADDRESS".to_string()
+    };
+    if search.shown != txt {
+        search.shown = txt.clone();
+        label.0 = txt;
+    }
+}
+
+#[derive(Component)]
+pub struct SearchLabel;
 #[derive(Component)]
 pub struct BigMapRoot;
 #[derive(Component)]
@@ -207,10 +419,18 @@ pub fn setup_maps(mut commands: Commands, mut images: ResMut<Assets<Image>>, gam
         ))
         .with_children(|p| {
             p.spawn((
-                Text::new("CLICK set destination   RIGHT-CLICK clear   SCROLL zoom   DRAG pan   M close"),
+                Text::new("CLICK set destination   RIGHT-CLICK clear   SCROLL zoom   DRAG pan   / search   M close"),
                 font(15.0),
                 TextColor(Color::srgb(0.6, 0.95, 1.0)),
                 Node { position_type: PositionType::Absolute, top: px(14), left: px(18), ..default() },
+            ));
+            p.spawn((
+                SearchLabel,
+                Text::new("/ SEARCH ADDRESS"),
+                font(20.0),
+                TextColor(Color::srgb(1.0, 0.95, 0.6)),
+                Node { position_type: PositionType::Absolute, top: px(42), left: px(18), padding: UiRect::all(px(6)), ..default() },
+                BackgroundColor(Color::srgba(0.02, 0.02, 0.08, 0.8)),
             ));
             p.spawn((
                 BigMapLabel,
@@ -514,6 +734,15 @@ pub fn draw_maps(
                 let t = ((*w / mpp).round() as i32).clamp(1, 60);
                 for s in pts.windows(2) {
                     cv.line(to(s[0]), to(s[1]), t, C_WATER);
+                }
+            }
+        }
+        // airport: runway and taxiways
+        for (w, pts) in &city.airstrips {
+            if visible(pts) {
+                let t = ((*w / mpp).round() as i32).clamp(1, 60);
+                for s in pts.windows(2) {
+                    cv.line(to(s[0]), to(s[1]), t, C_LOCAL);
                 }
             }
         }

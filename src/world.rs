@@ -13,6 +13,12 @@ use bevy::prelude::*;
 use bevy::reflect::TypePath;
 
 pub const CELL: f32 = 64.0;
+/// What the ground is made of at a spot (see `City::surface`).
+pub const S_GRASS: u8 = 0;
+pub const S_ROAD: u8 = 1;
+pub const S_PAVING: u8 = 2;
+pub const S_CONCRETE: u8 = 3;
+pub const S_WATER: u8 = 4;
 pub const TILE: f32 = 512.0;
 pub const LOAD_R: i32 = 3;
 const TILE_R: i32 = 2;
@@ -86,6 +92,21 @@ impl AssetLoader for TileLoader {
     }
 }
 
+/// Airport surfaces and landmark footprints (see `tools/build_extras.py`).
+static EXTRAS: &[u8] = include_bytes!("../data/extras.bin");
+
+/// A famous building or monument drawn as its own model in place of the generic block.
+pub struct Landmark {
+    /// 1 cathedral, 2 Gediminas' tower, 3 cathedral bell tower, 4 Europa tower, 5 town hall,
+    /// 6 St. Anne's, 7 St. Peter and Paul's, 8 Gate of Dawn, 9 opera house, 10 Grand Dukes'
+    /// palace, 11 TV tower, 12 Three Crosses.
+    pub kind: u8,
+    pub h: f32,
+    pub c: Vec2,
+    pub pts: Vec<Vec2>,
+    pub tris: Vec<u16>,
+}
+
 // ---- data -----------------------------------------------------------------
 pub struct Bld {
     pub lv: u8,
@@ -94,6 +115,9 @@ pub struct Bld {
     pub tris: Vec<u16>,
     pub min: Vec2,
     pub max: Vec2,
+    /// Streets that run through the building (archways, passages): centre line and half width.
+    /// The ground floor is left open there and does not block the way.
+    pub pass: Vec<(Vec2, Vec2, f32)>,
 }
 
 impl Bld {
@@ -184,6 +208,8 @@ pub struct CellSrc {
     pub segs: Vec<(Vec2, Vec2, f32)>,
     /// Drivable deck segments: a, b, half width, height at a, height at b.
     decks: Vec<(Vec2, Vec2, f32, f32, f32)>,
+    /// Raised road pieces with grassed embankments: the slope beside them can be driven on.
+    banks: Vec<(Vec2, Vec2, f32, f32, f32)>,
     /// Open cuttings (tunnel approach ramps): the ground is removed over these.
     holes: Vec<(Vec2, Vec2, f32)>,
     lights: Vec<(Vec2, u8, f32)>,
@@ -195,6 +221,15 @@ pub struct CellSrc {
     /// Speed cameras: position and the limit (km/h) they enforce.
     pub cams: Vec<(Vec2, u32)>,
     parked: Vec<(Vec2, f32)>,
+    /// Landmarks (index into `City::landmarks`) and parked aircraft (position, heading) here.
+    lms: Vec<u32>,
+    planes: Vec<(Vec2, f32)>,
+    /// Pedestrian crossings (the mapped walking line); the stripes are laid out when the cell is
+    /// built, from the road they cross.
+    zebras: Vec<Vec<Vec2>>,
+    /// Ground surface of the cell at 1 m resolution (64 x 64 of the `S_*` values), drawn from the
+    /// very triangles that are rendered. Empty until the cell is first built.
+    mask: Vec<u8>,
     scattered: bool,
     pub walk: Vec<u32>,
     pub poi: Option<Vec2>,
@@ -209,6 +244,9 @@ pub struct LightSite {
 
 pub struct Loaded {
     pub lights: Vec<LightSite>,
+    /// Solid street furniture standing in the cell (lamp posts, signals, shelters, pillars):
+    /// position and radius.
+    pub posts: Vec<(Vec2, f32)>,
     /// Everything at or above ground level; hidden while the player is in a tunnel.
     pub entity: Entity,
     /// Below-ground geometry (tunnels, cuttings).
@@ -240,6 +278,15 @@ pub struct City {
     pub collected: HashSet<IVec2>,
     /// Id of the way currently being ingested (tags its road paint).
     cur_way: u32,
+    /// Map tiles whose download failed: number of attempts so far and when to try again.
+    tile_retry: HashMap<IVec2, (u8, f32)>,
+    /// Paint used by `line`: 0 white, 4 yellow (taxiways).
+    paint: u8,
+    pub landmarks: Vec<Landmark>,
+    /// Runway and taxiways (width, centre line) for the city map.
+    pub airstrips: Vec<(f32, Vec<Vec2>)>,
+    /// Airport aprons: paved all over (bounds and outline).
+    aprons: Vec<(Vec2, Vec2, Vec<Vec2>)>,
 }
 
 pub fn cell_of(p: Vec2) -> IVec2 {
@@ -294,6 +341,44 @@ impl Rd<'_> {
         }
         (0..n).map(|_| self.u16()).collect()
     }
+}
+
+/// Left-hand unit normals at each point of a polyline, mitred at bends so that offset copies
+/// of the line stay parallel and join without gaps.
+fn mitres(pts: &[Vec2]) -> Vec<Vec2> {
+    let n = pts.len();
+    let dir = |i: usize| (pts[i + 1] - pts[i]).normalize_or_zero();
+    (0..n)
+        .map(|i| {
+            let d0 = if i > 0 { dir(i - 1) } else { Vec2::ZERO };
+            let d1 = if i + 1 < n { dir(i) } else { Vec2::ZERO };
+            let (d0, d1) = (if d0 == Vec2::ZERO { d1 } else { d0 }, if d1 == Vec2::ZERO { d0 } else { d1 });
+            let (n0, n1) = (Vec2::new(-d0.y, d0.x), Vec2::new(-d1.y, d1.x));
+            let m = (n0 + n1).normalize_or(n1);
+            m / m.dot(n1).max(0.5)
+        })
+        .collect()
+}
+
+/// Polyline with duplicate points dropped and extra points added so no piece is longer than `step`.
+fn resample(pts: &[Vec2], step: f32) -> Vec<Vec2> {
+    let mut out = vec![pts[0]];
+    for w in pts.windows(2) {
+        let l = w[0].distance(w[1]);
+        if l < 0.05 {
+            continue;
+        }
+        let k = (l / step).ceil().max(1.0) as i32;
+        for j in 1..=k {
+            out.push(w[0].lerp(w[1], j as f32 / k as f32));
+        }
+    }
+    out
+}
+
+/// Key for matching way end points (they are stored in decimetres).
+fn jkey(p: Vec2) -> (i32, i32) {
+    ((p.x * 10.0).round() as i32, (p.y * 10.0).round() as i32)
 }
 
 fn up_quad(mut q: Quad3) -> Quad3 {
@@ -412,7 +497,7 @@ impl City {
                 .collect();
             rivers.push((w, pts));
         }
-        City {
+        let mut city = City {
             spawn,
             names,
             t0,
@@ -430,6 +515,135 @@ impl City {
             cells: HashMap::default(),
             collected: HashSet::default(),
             cur_way: 0,
+            tile_retry: HashMap::default(),
+            paint: 0,
+            landmarks: vec![],
+            airstrips: vec![],
+            aprons: vec![],
+        };
+        city.load_extras();
+        city
+    }
+
+    /// The airport (runway, taxiways, apron, stands, parked aircraft) and the landmark list.
+    fn load_extras(&mut self) {
+        if EXTRAS.len() < 6 || &EXTRAS[0..4] != b"VLX1" {
+            return;
+        }
+        let mut r = Rd { d: EXTRAS, o: 4, origin: Vec2::ZERO };
+        let pt = |r: &mut Rd| {
+            let x = r.f32();
+            Vec2::new(x, r.f32())
+        };
+        for _ in 0..r.u16() {
+            let kind = r.u8();
+            let width = r.f32();
+            let n = r.u16();
+            let pts: Vec<Vec2> = (0..n).map(|_| pt(&mut r)).collect();
+            if pts.len() < 2 {
+                continue;
+            }
+            // short pieces, so every cell along the way knows about it
+            let pts = resample(&pts, 40.0);
+            if kind < 2 {
+                self.airstrips.push((width, pts.clone()));
+            }
+            self.cur_way += 1;
+            match kind {
+                0 => {
+                    // runway with paved shoulders and the standard markings
+                    self.strip(M_ASPHALT, &pts, width + 14.0);
+                    self.register_segs(&pts, width * 0.5 + 9.0);
+                    self.line(&pts, None, width * 0.5 - 1.0, 0.9, 235);
+                    self.line(&pts, None, -width * 0.5 + 1.0, 0.9, 235);
+                    let mut cum = vec![0.0f32];
+                    for w in pts.windows(2) {
+                        cum.push(cum[cum.len() - 1] + w[0].distance(w[1]));
+                    }
+                    let total = cum[cum.len() - 1];
+                    let at = |s: f32| {
+                        let i = cum.partition_point(|c| *c <= s).clamp(1, pts.len() - 1);
+                        pts[i - 1].lerp(pts[i], ((s - cum[i - 1]) / (cum[i] - cum[i - 1]).max(0.01)).clamp(0.0, 1.0))
+                    };
+                    // bars lying along the runway between distances s0 and s1, at sideways offsets
+                    let mut bars = |city: &mut City, s0: f32, s1: f32, offs: &[f32], w: f32| {
+                        for mirror in [false, true] {
+                            let (a, b) = if mirror { (at(total - s0), at(total - s1)) } else { (at(s0), at(s1)) };
+                            for o in offs {
+                                city.line(&[a, b], None, *o, w, 235);
+                                city.line(&[a, b], None, -*o, w, 235);
+                            }
+                        }
+                    };
+                    bars(self, 8.0, 38.0, &[2.7, 6.3, 9.9, 13.5, 17.1, 20.7], 1.8); // threshold "piano keys"
+                    bars(self, 150.0, 172.0, &[5.5, 8.5, 11.5], 1.8); // touchdown zone
+                    bars(self, 300.0, 345.0, &[9.0], 6.0); // aiming point
+                    bars(self, 450.0, 472.0, &[5.5, 8.5], 1.8);
+                    bars(self, 600.0, 622.0, &[5.5], 1.8);
+                    let mut s = 75.0;
+                    while s + 30.0 < total - 75.0 {
+                        self.line(&[at(s), at(s + 30.0)], None, 0.0, 0.9, 235); // centre line
+                        s += 50.0;
+                    }
+                }
+                1 => {
+                    self.strip(M_ASPHALT, &pts, width);
+                    self.register_segs(&pts, width * 0.5 + 1.0);
+                    self.paint = 4;
+                    self.line(&pts, None, 0.0, 0.3, 235);
+                    self.paint = 0;
+                }
+                _ => {
+                    self.paint = 4;
+                    self.line(&pts, None, 0.0, 0.3, 235);
+                    self.paint = 0;
+                }
+            }
+        }
+        // apron
+        for _ in 0..r.u16() {
+            let n = r.u16();
+            let pts: Vec<Vec2> = (0..n).map(|_| pt(&mut r)).collect();
+            let idx = r.idx();
+            for t in idx.chunks_exact(3) {
+                if t.iter().all(|&i| (i as usize) < pts.len()) {
+                    self.add_tri(M_ASPHALT, [pts[t[0] as usize], pts[t[1] as usize], pts[t[2] as usize]]);
+                }
+            }
+            let (min, max) = bounds(&pts);
+            self.aprons.push((min, max, pts));
+        }
+        for _ in 0..r.u16() {
+            let kind = r.u8();
+            let h = r.f32();
+            let c = pt(&mut r);
+            let n = r.u16();
+            let pts: Vec<Vec2> = (0..n).map(|_| pt(&mut r)).collect();
+            let tris = r.idx();
+            let id = self.landmarks.len() as u32;
+            self.src.entry(cell_of(c)).or_default().lms.push(id);
+            if pts.is_empty() {
+                self.block(c, if kind == 11 { 6.0 } else { 1.2 });
+            }
+            self.landmarks.push(Landmark { kind, h, c, pts, tris });
+        }
+        for _ in 0..r.u16() {
+            let p = pt(&mut r);
+            let hd = r.f32();
+            self.src.entry(cell_of(p)).or_default().planes.push((p, hd));
+            for k in [-13.0f32, -7.0, 0.0, 7.0, 13.0] {
+                self.block(p + Vec2::from_angle(hd) * k, 2.3);
+            }
+        }
+    }
+
+    /// Solid round obstacle (registered in every cell it can be reached from).
+    fn block(&mut self, c: Vec2, rad: f32) {
+        let (lo, hi) = (cell_of(c - (rad + 3.0)), cell_of(c + (rad + 3.0)));
+        for cz in lo.y..=hi.y {
+            for cx in lo.x..=hi.x {
+                self.src.entry(IVec2::new(cx, cz)).or_default().rounds.push((c, rad));
+            }
         }
     }
 
@@ -497,6 +711,21 @@ impl City {
                 }
             }
         }
+        // the grassed slope down from a raised road
+        for (a, b, hw, ya, yb) in &c.banks {
+            let ab = *b - *a;
+            let t = ((p - *a).dot(ab) / ab.length_squared().max(1e-6)).clamp(0.0, 1.0);
+            let d = (*a + ab * t).distance(p);
+            let h = ya + (yb - ya) * t;
+            let run = h * 1.7 + 0.3;
+            // (not on a road at ground level: there the slope is cut back to a wall)
+            if d > *hw && d < *hw + run && h > 0.2 && !c.roads.iter().any(|(ra, rb, rhw, _, ry)| ry.abs() < 1.5 && seg_dist(p, *ra, *rb) < *rhw + 1.2) {
+                let hs = h * (1.0 - (d - *hw) / run);
+                if (hs - cur).abs() < 2.2 {
+                    best = best.max(hs);
+                }
+            }
+        }
         // a cutting or tunnel floor within reach wins over the ground it is dug into
         if low < -0.05 { low } else { best }
     }
@@ -550,6 +779,109 @@ impl City {
             }
         }
         None
+    }
+
+    /// Rasterises the ground of cell `c`: every asphalt, paving, concrete and water triangle
+    /// (its own and those reaching in from the neighbouring cells) is painted into a 1 m grid, in
+    /// the order they are stacked on screen, so the grid says exactly what one sees from above.
+    fn build_mask(&mut self, c: IVec2) {
+        const N: usize = 64;
+        let o = c.as_vec2() * CELL;
+        let mut m = vec![S_GRASS; N * N];
+        for (mat, val) in [(M_WATER, S_WATER), (M_CONCRETE, S_CONCRETE), (M_PAVING, S_PAVING), (M_ASPHALT, S_ROAD)] {
+            for dz in -1..=1 {
+                for dx in -1..=1 {
+                    let Some(s) = self.src.get(&(c + IVec2::new(dx, dz))) else { continue };
+                    for t in &s.tris[mat] {
+                        let lo = (t[0].min(t[1]).min(t[2]) - o - 0.5).floor().max(Vec2::ZERO);
+                        let hi = (t[0].max(t[1]).max(t[2]) - o + 0.5).ceil().min(Vec2::splat(N as f32));
+                        if lo.x >= hi.x || lo.y >= hi.y {
+                            continue;
+                        }
+                        let sign = if (t[1] - t[0]).perp_dot(t[2] - t[0]) < 0.0 { -1.0 } else { 1.0 };
+                        for z in lo.y as usize..hi.y as usize {
+                            for x in lo.x as usize..hi.x as usize {
+                                let p = o + Vec2::new(x as f32 + 0.5, z as f32 + 0.5);
+                                // inside, or within a hand's breadth of the edge
+                                let inside = (0..3).all(|i| {
+                                    let e = t[(i + 1) % 3] - t[i];
+                                    e.perp_dot(p - t[i]) * sign >= -0.3 * e.length()
+                                });
+                                if inside {
+                                    m[z * N + x] = val;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        self.src.entry(c).or_default().mask = m;
+    }
+
+    /// What the ground is at `p`: one of `S_GRASS`, `S_ROAD` (any asphalt: carriageways, junction
+    /// mouths, service roads, runways), `S_PAVING`, `S_CONCRETE` (car parks), `S_WATER`.
+    pub fn surface(&self, p: Vec2) -> u8 {
+        let c = cell_of(p);
+        match self.src.get(&c) {
+            Some(s) if !s.mask.is_empty() => {
+                let l = p - c.as_vec2() * CELL;
+                s.mask[(l.y as usize).min(63) * 64 + (l.x as usize).min(63)]
+            }
+            // not built yet: go by the road centre lines
+            _ => if self.near_way(p, 0.0) { S_ROAD } else { S_GRASS },
+        }
+    }
+
+    /// True on anything hard to drive on (asphalt, paving, concrete).
+    pub fn hard(&self, p: Vec2) -> bool {
+        matches!(self.surface(p), S_ROAD | S_PAVING | S_CONCRETE)
+    }
+
+    /// How far above the bare terrain the surface at `p` lies: roads and paths are built up a
+    /// little, the lawn is not.
+    pub fn foot_y(&self, p: Vec2) -> f32 {
+        match self.surface(p) {
+            S_ROAD => 0.3,
+            S_PAVING => 0.17,
+            S_CONCRETE => 0.08,
+            S_WATER => 0.0,
+            _ => 0.03,
+        }
+    }
+
+    /// Where a bus heading `dir` near `p` should drive: the middle of the kerbside lane of the
+    /// nearest road running its way. None when no such road is close (the route is then followed as is).
+    pub fn bus_lane(&self, p: Vec2, dir: Vec2) -> Option<Vec2> {
+        let c = cell_of(p);
+        let mut best: Option<(f32, Vec2)> = None;
+        for dz in -1..=1 {
+            for dx in -1..=1 {
+                for &e in self.drive_in(c + IVec2::new(dx, dz)) {
+                    let ed = &self.drive.edges[e as usize];
+                    for w in ed.pts.windows(2) {
+                        let ab = w[1] - w[0];
+                        let sd = ab.normalize_or_zero();
+                        let along = sd.dot(dir);
+                        // must run the bus's way; one-way streets only in their own direction
+                        if along.abs() < 0.8 || (ed.oneway && along < 0.0) {
+                            continue;
+                        }
+                        let t = ((p - w[0]).dot(ab) / ab.length_squared().max(1e-6)).clamp(0.0, 1.0);
+                        let q = w[0] + ab * t;
+                        let d = q.distance_squared(p);
+                        if d < 14.0 * 14.0 && best.is_none_or(|b| d < b.0) {
+                            let lanes = ed.lanes.max(1) as f32;
+                            let lw = (ed.width / lanes).clamp(2.6, 3.6);
+                            let off = (ed.width * 0.5 - lw * 0.5).max(0.0);
+                            let travel = if along < 0.0 { -sd } else { sd };
+                            best = Some((d, q + Vec2::new(-travel.y, travel.x) * off));
+                        }
+                    }
+                }
+            }
+        }
+        best.map(|b| b.1)
     }
 
     /// Fastest legal driving route between two points, as a polyline.
@@ -642,6 +974,9 @@ impl City {
             if p.x < b.min.x - r || p.x > b.max.x + r || p.y < b.min.y - r || p.y > b.max.y + r {
                 continue;
             }
+            if b.pass.iter().any(|(a, c, hw)| seg_dist(p, *a, *c) < *hw + 0.5) {
+                continue; // in an archway under the building
+            }
             let (near, d2, inside) = nearest_on_poly(p, &b.pts);
             if inside {
                 let dir = (near - p).normalize_or(Vec2::X);
@@ -659,6 +994,16 @@ impl City {
             if d.length_squared() < rr * rr {
                 p = *t + d.normalize_or(Vec2::X) * rr;
                 hit = true;
+            }
+        }
+        if let Some(loaded) = self.cells.get(&cell_of(p)) {
+            for (t, pr) in &loaded.posts {
+                let d = p - *t;
+                let rr = r + pr;
+                if d.length_squared() < rr * rr {
+                    p = *t + d.normalize_or(Vec2::X) * rr;
+                    hit = true;
+                }
             }
         }
         for (t, ir) in &cell.rounds {
@@ -689,9 +1034,10 @@ impl City {
         })
     }
 
-    fn near_way(&self, p: Vec2, margin: f32) -> bool {
+    pub fn near_way(&self, p: Vec2, margin: f32) -> bool {
         self.src(cell_of(p))
             .is_some_and(|c| c.segs.iter().any(|(a, b, hw)| seg_dist(p, *a, *b) < hw + margin))
+            || self.aprons.iter().any(|(lo, hi, pts)| p.x > lo.x && p.x < hi.x && p.y > lo.y && p.y < hi.y && nearest_on_poly(p, pts).2)
     }
 
     // ---- tile ingestion ---------------------------------------------------
@@ -712,36 +1058,34 @@ impl City {
     }
 
     fn strip(&mut self, m: usize, pts: &[Vec2], width: f32) {
-        let hw = width * 0.5;
+        let rp = resample(pts, 8.0);
+        let hw = vec![width * 0.5; rp.len()];
+        self.strip_w(m, &rp, &hw);
+    }
+
+    /// Ribbon with a half-width per point: mitred at bends (so its edges run smooth instead of
+    /// bulging at every vertex) and rounded at both ends and at hairpins.
+    fn strip_w(&mut self, m: usize, pts: &[Vec2], hw: &[f32]) {
         let n = pts.len();
+        if n < 2 {
+            return;
+        }
+        let nm = mitres(pts);
         for i in 0..n - 1 {
             let (a, b) = (pts[i], pts[i + 1]);
-            let d = (b - a).normalize_or_zero();
-            if d == Vec2::ZERO {
-                continue;
-            }
-            let nn = Vec2::new(-d.y, d.x) * hw;
-            let pieces = (a.distance(b) / 8.0).ceil().max(1.0) as i32;
-            for k in 0..pieces {
-                let (p0, p1) = (a.lerp(b, k as f32 / pieces as f32), a.lerp(b, (k + 1) as f32 / pieces as f32));
-                if hw > 4.0 {
-                    self.add_tri(m, [p0 + nn, p0, p1]);
-                    self.add_tri(m, [p0 + nn, p1, p1 + nn]);
-                    self.add_tri(m, [p0, p0 - nn, p1 - nn]);
-                    self.add_tri(m, [p0, p1 - nn, p1]);
-                } else {
-                    self.add_tri(m, [p0 + nn, p0 - nn, p1 - nn]);
-                    self.add_tri(m, [p0 + nn, p1 - nn, p1 + nn]);
-                }
-            }
-            // round off ends and noticeable bends
-            let bend = i + 2 < n && d.dot((pts[i + 2] - b).normalize_or_zero()) < 0.995;
-            for (p, cap) in [(a, i == 0), (b, i == n - 2 || bend)] {
-                if cap {
-                    let ring: Vec<Vec2> = (0..8).map(|k| p + Vec2::from_angle(k as f32 * 0.7854) * hw).collect();
-                    for k in 1..7 {
-                        self.add_tri(m, [ring[0], ring[k], ring[k + 1]]);
-                    }
+            let (na, nb) = (nm[i] * hw[i], nm[i + 1] * hw[i + 1]);
+            self.add_tri(m, [a + na, a - na, b - nb]);
+            self.add_tri(m, [a + na, b - nb, b + nb]);
+        }
+        for i in 0..n {
+            let sharp = i > 0
+                && i + 1 < n
+                && (pts[i] - pts[i - 1]).normalize_or_zero().dot((pts[i + 1] - pts[i]).normalize_or_zero()) < 0.6;
+            if i == 0 || i == n - 1 || sharp {
+                let ring: Vec<Vec2> =
+                    (0..14).map(|k| pts[i] + Vec2::from_angle(k as f32 / 14.0 * std::f32::consts::TAU) * hw[i]).collect();
+                for k in 1..13 {
+                    self.add_tri(m, [ring[0], ring[k], ring[k + 1]]);
                 }
             }
         }
@@ -762,11 +1106,13 @@ impl City {
     /// Road surface that follows per-point heights: bridge decks, ramps, cuttings and tunnels.
     /// Side structures are only recorded here; they are built per cell once the neighbouring
     /// roads are known, so nothing gets walled off where two raised roads merge.
-    fn strip_elev(&mut self, m: usize, pts: &[Vec2], ys: &[f32], width: f32, bridge: bool, tunnel: bool) {
-        let hw = width * 0.5;
+    fn strip_elev(&mut self, m: usize, pts: &[Vec2], ys: &[f32], widths: &[f32], bridge: bool, tunnel: bool) {
         let n = pts.len();
         let up = |p: Vec2, y: f32| Vec3::new(p.x, y, p.y);
         let mut run = 0.0;
+        // mitred joins: the surface bends smoothly through each point instead of being patched
+        // with a flat plate there (those stood proud of the slope on every ramp)
+        let nm = mitres(pts);
         for i in 0..n - 1 {
             let (a, b) = (pts[i], pts[i + 1]);
             let (ya, yb) = (ys[i], ys[i + 1]);
@@ -775,17 +1121,19 @@ impl City {
                 continue;
             }
             let d = (b - a) / len;
+            let (ha, hb) = (widths[i] * 0.5, widths[i + 1] * 0.5);
+            let hw = ha.max(hb);
             let nn = Vec2::new(-d.y, d.x) * hw;
             let sy = 0.3;
             let cen = cell_of((a + b) * 0.5);
             let s = self.src.entry(cen).or_default();
             // wound so the surface faces up (same convention as the flat ground layers)
-            s.deck[m].push([up(a + nn, ya + sy), up(b - nn, yb + sy), up(a - nn, ya + sy)]);
-            s.deck[m].push([up(a + nn, ya + sy), up(b + nn, yb + sy), up(b - nn, yb + sy)]);
-            let ring: Vec<Vec3> = (0..8).map(|k| up(b + Vec2::from_angle(-(k as f32) * 0.7854) * hw, yb + sy)).collect();
-            for k in 1..7 {
-                s.deck[m].push([ring[0], ring[k], ring[k + 1]]);
-            }
+            let (na, nb) = (nm[i] * ha, nm[i + 1] * hb);
+            s.deck[m].push([up(a + na, ya + sy), up(b - nb, yb + sy), up(a - na, ya + sy)]);
+            s.deck[m].push([up(a + na, ya + sy), up(b + nb, yb + sy), up(b - nb, yb + sy)]);
+            // (no end caps: where a ramp meets the ground, or the next piece of deck, a plate there
+            // would lie on top of the road it joins and show as a pale disc)
+            let _ = d;
             // physics: the deck can be driven on
             let (lo, hi) = (cell_of(a.min(b) - (hw + 2.0)), cell_of(a.max(b) + (hw + 2.0)));
             for cz in lo.y..=hi.y.min(lo.y + 4) {
@@ -799,8 +1147,18 @@ impl City {
             }
             let covered = tunnel && top < -3.0;
             let kind = if low < -0.25 { if covered { 3 } else { 2 } } else if bridge { 0 } else { 1 };
+            if kind == 1 {
+                // the embankment is solid ground: remember it wherever its slope can reach
+                let reach = hw + top * 1.7 + 3.0;
+                let (lo, hi) = (cell_of(a.min(b) - reach), cell_of(a.max(b) + reach));
+                for cz in lo.y..=hi.y.min(lo.y + 4) {
+                    for cx in lo.x..=hi.x.min(lo.x + 4) {
+                        self.src.entry(IVec2::new(cx, cz)).or_default().banks.push((a, b, hw, ya, yb));
+                    }
+                }
+            }
             for side in [1.0f32, -1.0] {
-                let (ea, eb) = (a + nn * side, b + nn * side);
+                let (ea, eb) = (a + na * side, b + nb * side);
                 let e = if side > 0.0 { (ea, eb, ya, yb, kind, m == 0) } else { (eb, ea, yb, ya, kind, m == 0) };
                 self.src.entry(cen).or_default().edges.push(e);
             }
@@ -827,11 +1185,13 @@ impl City {
                 }
                 2 => {
                     // concrete apron around the cutting hides the stepped edge of the hole in the ground
+                    // (one continuous paved band following the bends of the road; plain paving, not
+                    // the car-park surface with its bay markings)
                     for side in [1.0f32, -1.0] {
-                        let (ea, eb) = (a + nn * side, b + nn * side);
-                        let (o0, o1) = (a + nn * side * (1.0 + 4.0 / hw), b + nn * side * (1.0 + 4.0 / hw));
-                        self.add_tri(M_CONCRETE, [ea, o0, o1]);
-                        self.add_tri(M_CONCRETE, [ea, o1, eb]);
+                        let (ea, eb) = (a + na * side, b + nb * side);
+                        let (o0, o1) = (a + nm[i] * (ha + 4.5) * side, b + nm[i + 1] * (hb + 4.5) * side);
+                        self.add_tri(M_PAVING, [ea, o0, o1]);
+                        self.add_tri(M_PAVING, [ea, o1, eb]);
                     }
                     let (lo, hi) = (cell_of(a.min(b) - (hw + 4.0)), cell_of(a.max(b) + (hw + 4.0)));
                     for cz in lo.y..=hi.y.min(lo.y + 4) {
@@ -871,7 +1231,7 @@ impl City {
                 let (t0, t1) = (k as f32 / pieces as f32, (k + 1) as f32 / pieces as f32);
                 let (p, e) = (w[0].lerp(w[1], t0) - d * 0.12 + nn * off, w[0].lerp(w[1], t1) + d * 0.12 + nn * off);
                 let (y0, y1) = (ya + (yb - ya) * t0, ya + (yb - ya) * t1);
-                self.add_quad([v(p + h, y0), v(p - h, y0), v(e - h, y1), v(e + h, y1)], 0, shade);
+                self.add_quad([v(p + h, y0), v(p - h, y0), v(e - h, y1), v(e + h, y1)], self.paint, shade);
             }
         }
     }
@@ -957,6 +1317,34 @@ impl City {
         if data.len() < 6 || &data[0..4] != b"VLT2" {
             return;
         }
+        // Where exactly two carriageways meet end to end (a road gaining or losing a lane), both
+        // are tapered to a shared width so kerbs and edge lines run through without a step.
+        // Per end point: number of ways and the narrowest of them (the joint takes that width, so
+        // the widening happens inside the wider piece). Bridges and ramps are treated the same.
+        let mut joints: HashMap<(i32, i32), (u32, f32)> = HashMap::default();
+        {
+            let mut r = Rd { d: data, o: 4, origin: tile.as_vec2() * TILE };
+            for _ in 0..r.u16() {
+                if !r.ok(9) {
+                    break;
+                }
+                let kind = r.u8();
+                let width = r.u16() as f32 * 0.1;
+                let flags = r.u8();
+                r.o += 3;
+                let pts = r.poly();
+                if flags & 8 != 0 && r.ok(pts.len()) {
+                    r.o += pts.len();
+                }
+                if kind == 0 && pts.len() >= 2 {
+                    for p in [pts[0], pts[pts.len() - 1]] {
+                        let j = joints.entry(jkey(p)).or_insert((0, f32::MAX));
+                        j.0 += 1;
+                        j.1 = j.1.min(width);
+                    }
+                }
+            }
+        }
         let mut r = Rd { d: data, o: 4, origin: tile.as_vec2() * TILE };
         for _ in 0..r.u16() {
             if !r.ok(9) {
@@ -994,39 +1382,90 @@ impl City {
             let bridge = flags & 4 != 0;
             match kind {
                 0 => {
+                    if !bridge && !tunnel {
+                        self.register_segs(&pts, width * 0.5 + 1.0);
+                    }
+                    // width along the way. It blends into a narrower neighbour's over the last 30 m,
+                    // and a short piece mapped wider than the road at both its ends (typically a
+                    // bridge) simply takes the width of the road it carries.
+                    let jw = |p: Vec2| joints.get(&jkey(p)).map_or(width, |j| if j.0 == 2 { j.1.min(width) } else { width });
+                    let (w0, w1) = (jw(pts[0]), jw(pts[pts.len() - 1]));
+                    let way_len: f32 = pts.windows(2).map(|w| w[0].distance(w[1])).sum();
+                    let full = width;
+                    let width = if w0 < full && w1 < full && way_len < 220.0 { w0.max(w1) } else { full };
+                    let lanes = ((lanes as f32 * width / full).round() as u8).max(1);
+                    let sm = |x: f32| {
+                        let x = x.clamp(0.0, 1.0);
+                        x * x * (3.0 - 2.0 * x)
+                    };
+                    let width_at = |s: f32, total: f32| {
+                        let tl = (total * 0.5).min(30.0).max(0.01);
+                        width + (w0 - width) * sm(1.0 - s / tl) + (w1 - width) * sm(1.0 - (total - s) / tl)
+                    };
+                    let lf = lanes as f32;
                     if elevated {
-                        self.strip_elev(0, &pts, &ys, width + 1.6, bridge, tunnel);
+                        let mut s = 0.0;
+                        let mut wide = vec![width_at(0.0, way_len) + 1.6];
+                        for w in pts.windows(2) {
+                            s += w[0].distance(w[1]);
+                            wide.push(width_at(s, way_len) + 1.6);
+                        }
+                        self.strip_elev(0, &pts, &ys, &wide, bridge, tunnel);
                         // approach ramps still need ground underneath their low end
                         if ys.iter().any(|y| *y < 0.5) && ys.iter().all(|y| *y > -0.1) {
                             self.strip(M_PAVING, &pts, width + 2.2);
                         }
-                    } else {
-                        self.strip(M_PAVING, &pts, width + 2.2); // kerb line under the carriageway
-                        self.strip(M_ASPHALT, &pts, width + 0.6);
-                    }
-                    if !bridge && !tunnel {
-                        self.register_segs(&pts, width * 0.5 + 1.0);
-                    }
-                    let lw = width / lanes as f32;
-                    match mark {
-                        1 => self.dashes(&pts, ysl, 0.0, 9.0, 3.0, 0.2, 120),
-                        2 => {
-                            self.line(&pts, ysl, 0.16, 0.13, 150);
-                            self.line(&pts, ysl, -0.16, 0.13, 150);
-                            self.dashes(&pts, ysl, width / 4.0, 9.0, 3.0, 0.2, 120);
-                            self.dashes(&pts, ysl, -width / 4.0, 9.0, 3.0, 0.2, 120);
-                        }
-                        3 => {
-                            for l in 1..lanes {
-                                self.dashes(&pts, ysl, -width / 2.0 + l as f32 * lw, 9.0, 3.0, 0.2, 120);
+                        match mark {
+                            1 => self.dashes(&pts, ysl, 0.0, 9.0, 3.0, 0.2, 130),
+                            2 => {
+                                self.line(&pts, ysl, 0.16, 0.13, 150);
+                                self.line(&pts, ysl, -0.16, 0.13, 150);
+                                self.dashes(&pts, ysl, width / 4.0, 9.0, 3.0, 0.2, 130);
+                                self.dashes(&pts, ysl, -width / 4.0, 9.0, 3.0, 0.2, 130);
                             }
+                            3 => {
+                                for l in 1..lanes {
+                                    self.dashes(&pts, ysl, -width / 2.0 + l as f32 * width / lf, 9.0, 3.0, 0.2, 130);
+                                }
+                            }
+                            _ => {}
                         }
-                        _ => {}
-                    }
-                    if lclass <= 1 && !elevated {
-                        // solid edge lines on main roads
-                        self.line(&pts, None, width / 2.0 - 0.1, 0.14, 110);
-                        self.line(&pts, None, -width / 2.0 + 0.1, 0.14, 110);
+                    } else {
+                        let rp = resample(&pts, 6.0);
+                        let mut cum = vec![0.0f32];
+                        for w in rp.windows(2) {
+                            cum.push(cum[cum.len() - 1] + w[0].distance(w[1]));
+                        }
+                        let total = cum[cum.len() - 1];
+                        let wv: Vec<f32> = cum.iter().map(|s| width_at(*s, total)).collect();
+                        let nm = mitres(&rp);
+                        // a copy of the centre line shifted sideways by an amount that follows the width
+                        let at = |f: &dyn Fn(f32) -> f32| -> Vec<Vec2> { (0..rp.len()).map(|i| rp[i] + nm[i] * f(wv[i])).collect() };
+                        let kerb: Vec<f32> = wv.iter().map(|w| w * 0.5 + 1.1).collect();
+                        let road: Vec<f32> = wv.iter().map(|w| w * 0.5 + 0.3).collect();
+                        self.strip_w(M_PAVING, &rp, &kerb); // kerb line under the carriageway
+                        self.strip_w(M_ASPHALT, &rp, &road);
+                        match mark {
+                            1 => self.dashes(&rp, None, 0.0, 9.0, 3.0, 0.2, 130),
+                            2 => {
+                                self.line(&at(&|_| 0.16), None, 0.0, 0.13, 150);
+                                self.line(&at(&|_| -0.16), None, 0.0, 0.13, 150);
+                                self.dashes(&at(&|w| w / 4.0), None, 0.0, 9.0, 3.0, 0.2, 130);
+                                self.dashes(&at(&|w| -w / 4.0), None, 0.0, 9.0, 3.0, 0.2, 130);
+                            }
+                            3 => {
+                                for l in 1..lanes {
+                                    let k = l as f32 / lf;
+                                    self.dashes(&at(&|w| -w / 2.0 + k * w), None, 0.0, 9.0, 3.0, 0.2, 130);
+                                }
+                            }
+                            _ => {}
+                        }
+                        if lclass <= 1 {
+                            // solid edge lines on main roads
+                            self.line(&at(&|w| w / 2.0 - 0.12), None, 0.0, 0.15, 125);
+                            self.line(&at(&|w| -w / 2.0 + 0.12), None, 0.0, 0.15, 125);
+                        }
                     }
                     if !tunnel {
                         self.lights_along(&pts, ysl, 34.0, width / 2.0 + 1.9, lclass.min(2));
@@ -1050,20 +1489,10 @@ impl City {
                 }
                 _ => {
                     if kind == 3 {
-                        for w in pts.windows(2) {
-                            let l = w[0].distance(w[1]);
-                            let n = (l / 4.0).round().max(1.0) as i32;
-                            let d = (w[1] - w[0]) / l.max(0.01);
-                            let nn = Vec2::new(-d.y, d.x) * 1.6;
-                            for k in 0..n {
-                                let p0 = w[0] + d * (l * k as f32 / n as f32);
-                                let p1 = w[0] + d * (l * (k + 1) as f32 / n as f32);
-                                let v = |p: Vec2| Vec3::new(p.x, 0.0, p.y);
-                                self.add_quad([v(p0 + nn), v(p0 - nn), v(p1 - nn), v(p1 + nn)], 3, 255);
-                            }
-                        }
+                        let mid = (pts[0] + pts[pts.len() - 1]) * 0.5;
+                        self.src.entry(cell_of(mid)).or_default().zebras.push(pts.clone());
                     } else if elevated {
-                        self.strip_elev(1, &pts, &ys, width + 0.6, !tunnel, tunnel);
+                        self.strip_elev(1, &pts, &ys, &vec![width + 0.6; pts.len()], !tunnel, tunnel);
                     } else {
                         self.strip(M_PAVING, &pts, width);
                         self.register_segs(&pts, width * 0.5);
@@ -1106,14 +1535,48 @@ impl City {
             let (min, max) = bounds(&pts);
             let id = self.blds.len() as u32;
             let cen = pts.iter().sum::<Vec2>() / pts.len() as f32;
-            self.src.entry(cell_of(cen)).or_default().own.push(id);
+            // a landmark is drawn as its own model instead (the footprint still blocks the way)
+            let landmark = self.landmarks.iter().any(|l| {
+                if l.pts.len() < 3 {
+                    cen.distance(l.c) < 10.0
+                } else {
+                    cen.distance(l.c) < 3.0 || (cen.distance(l.c) < 150.0 && nearest_on_poly(cen, &l.pts).2)
+                }
+            });
+            if !landmark {
+                self.src.entry(cell_of(cen)).or_default().own.push(id);
+            }
             let (lo, hi) = (cell_of(min - 3.0), cell_of(max + 3.0));
             for cz in lo.y..=hi.y {
                 for cx in lo.x..=hi.x {
                     self.src.entry(IVec2::new(cx, cz)).or_default().col.push(id);
                 }
             }
-            self.blds.push(Bld { lv, kind, pts, tris, min, max });
+            // streets passing through the footprint
+            let mut pass = vec![];
+            let (lo, hi) = (cell_of(min), cell_of(max));
+            let mut seen: Vec<u32> = vec![];
+            for cz in lo.y..=hi.y {
+                for cx in lo.x..=hi.x {
+                    for &e in self.drive_in(IVec2::new(cx, cz)) {
+                        if seen.contains(&e) {
+                            continue;
+                        }
+                        seen.push(e);
+                        let ed = &self.drive.edges[e as usize];
+                        for w in ed.pts.windows(2) {
+                            if w[0].max(w[1]).cmplt(min).any() || w[0].min(w[1]).cmpgt(max).any() {
+                                continue;
+                            }
+                            let steps = (w[0].distance(w[1]) / 2.0).ceil().max(1.0) as i32;
+                            if (0..=steps).any(|k| nearest_on_poly(w[0].lerp(w[1], k as f32 / steps as f32), &pts).2) {
+                                pass.push((w[0], w[1], ed.width * 0.5 + 0.6));
+                            }
+                        }
+                    }
+                }
+            }
+            self.blds.push(Bld { lv, kind, pts, tris, min, max, pass });
         }
         for _ in 0..r.u16() {
             if !r.ok(3) {
@@ -1125,6 +1588,19 @@ impl City {
             if kind == 5 && pts.len() == 2 {
                 // roundabout island
                 let (c, rad) = (pts[0], pts[0].distance(pts[1]));
+                // only a real traffic island: a big "roundabout" ring round a square, or one with
+                // streets running through its middle, is not a solid landscaped disc
+                let (lo, hi) = (cell_of(c - rad), cell_of(c + rad));
+                let crossed = (lo.y..=hi.y).any(|cz| {
+                    (lo.x..=hi.x).any(|cx| {
+                        self.drive_in(IVec2::new(cx, cz))
+                            .iter()
+                            .any(|&e| self.drive.edges[e as usize].pts.windows(2).any(|w| seg_dist(c, w[0], w[1]) < rad - 2.5))
+                    })
+                });
+                if rad > 26.0 || crossed {
+                    continue;
+                }
                 self.src.entry(cell_of(c)).or_default().islands.push((c, rad));
                 let (lo, hi) = (cell_of(c - rad - 2.0), cell_of(c + rad + 2.0));
                 for cz in lo.y..=hi.y {
@@ -1202,7 +1678,7 @@ impl City {
                 Some(_) => 0.3,
                 None => 0.13,
             };
-            if keep < dens && !self.near_way(p, 2.4) && !self.in_building(p, 2.6) {
+            if keep < dens && !self.near_way(p, 2.4) && !self.in_building(p, 2.6) && self.surface(p) == S_GRASS {
                 trees.push((p, size));
             }
         }
@@ -1276,8 +1752,14 @@ fn add_building(b: &Bld, id: u32, mb: &mut MB, roof: &mut Flat, glow: &mut MB, s
         for k in 0..cols {
             let p0 = a.lerp(c, k as f32 / cols as f32);
             let p1 = a.lerp(c, (k + 1) as f32 / cols as f32);
+            // archway: the ground floor stays open where a street runs through
+            let mid = (p0 + p1) * 0.5;
+            let open = b.pass.iter().any(|(a, c, hw)| seg_dist(mid, *a, *c) < *hw + 1.2);
             for row in 0..rows {
                 let v = rng.int(4);
+                if open && (row as f32 + 0.5) * rh < 4.6 {
+                    continue;
+                }
                 let shop = row == 0 && shops && len > 5.0;
                 let tile = if shop { T_SHOP + v } else { T_WALL + style * 4 + v };
                 // walls darken toward the street, which gives tall blocks real depth
@@ -1485,7 +1967,18 @@ pub fn stream_world(
             if blobs.contains(h) {
                 arrived.push((*t, Some(h.clone())));
             } else if matches!(assets.load_state(h), LoadState::Failed(_)) {
-                arrived.push((*t, None));
+                // A failed download must not leave a hole in the city (bare grass with traffic
+                // driving over it): ask again, a little later each time, and only give up after
+                // several attempts.
+                let (tries, next) = city.tile_retry.get(t).copied().unwrap_or((0, 0.0));
+                if game.time >= next {
+                    if tries >= 8 {
+                        arrived.push((*t, None));
+                    } else {
+                        assets.reload(format!("map/{}_{}.bin", t.x, t.y));
+                        city.tile_retry.insert(*t, (tries + 1, game.time + 1.5 + tries as f32 * 1.5));
+                    }
+                }
             }
         }
     }
@@ -1524,6 +2017,9 @@ pub fn stream_world(
     missing.sort_by_key(|c| (c.x - center.x).abs().max((c.y - center.y).abs()));
     let budget = if city.cells.len() < 9 { 100 } else { 2 };
     for c in missing.into_iter().take(budget) {
+        if !city.src(c).is_some_and(|s| !s.mask.is_empty()) {
+            city.build_mask(c);
+        }
         if !city.src(c).is_some_and(|s| s.scattered) {
             city.scatter(c);
         }
@@ -1536,6 +2032,7 @@ pub fn stream_world(
         glow.lift = 0.32; // glows and shadows float just above the road surface
         let mut roof = Flat::default();
         let mut lights: Vec<LightSite> = vec![];
+        let mut posts: Vec<(Vec2, f32)> = vec![];
 
         // ground layers
         let mut grass = Flat::default();
@@ -1557,7 +2054,7 @@ pub fn stream_world(
         let dip: Vec<f32> = (0..(n + 1) * (n + 1))
             .map(|i| {
                 let p = o + Vec2::new((i % (n + 1)) as f32, (i / (n + 1)) as f32) * step;
-                if src.segs.iter().any(|(a, b, hw)| seg_dist(p, *a, *b) < *hw + 3.2) { -0.55 } else { 0.0 }
+                if src.segs.iter().any(|(a, b, hw)| seg_dist(p, *a, *b) < *hw + 3.2) { -0.2 } else { 0.0 }
             })
             .collect();
         for gz in 0..n {
@@ -1575,6 +2072,39 @@ pub fn stream_world(
                 grass.tri_cy([q[0], q[2], q[3]], [d[0], d[2], d[3]], M_SPAN[M_GRASS], [k[0], k[2], k[3]]);
             }
         }
+        // grassed embankments of raised roads: same turf as the ground they run down to. Where the
+        // slope would spill over another road at ground level (a street passing beneath a
+        // viaduct's approach), it is cut back to an upright retaining wall instead.
+        grass.tint = Some([0.82, 0.86, 0.82, 1.0]);
+        let on_ground_road = |p: Vec2| src.roads.iter().any(|(a, b, hw, _, ry)| ry.abs() < 1.5 && seg_dist(p, *a, *b) < *hw + 1.2);
+        for (p, q, yp, yq, kind, _) in &src.edges {
+            if *kind != 1 {
+                continue;
+            }
+            let (p, q, yp, yq) = (*p, *q, *yp, *yq);
+            let d = (q - p).normalize_or_zero();
+            let out = Vec2::new(-d.y, d.x);
+            if city.deck_adjacent((p + q) * 0.5 + out * 1.0, (yp + yq) * 0.5) {
+                continue;
+            }
+            let v = |a: Vec2, y: f32| Vec3::new(a.x, y, a.y);
+            let pieces = (p.distance(q) / 6.0).ceil().max(1.0) as i32;
+            for k in 0..pieces {
+                let (t0, t1) = (k as f32 / pieces as f32, (k + 1) as f32 / pieces as f32);
+                let (a, b, ya, yb) = (p.lerp(q, t0), p.lerp(q, t1), yp + (yq - yp) * t0, yp + (yq - yp) * t1);
+                let (oa, ob) = (a + out * (ya * 1.7 + 0.3), b + out * (yb * 1.7 + 0.3));
+                let blocked = [0.35f32, 0.7, 1.0].iter().any(|f| on_ground_road(((a + b) * 0.5).lerp((oa + ob) * 0.5, *f)));
+                if blocked {
+                    mb.quad([v(a, ya + 0.3), v(a, -0.5), v(b, -0.5), v(b, yb + 0.3)], T_METAL, 0, [0.42, 0.42, 0.47, 1.0]);
+                    continue;
+                }
+                for t in [[v(a, ya + 0.3), v(oa, 0.02), v(ob, 0.02)], [v(a, ya + 0.3), v(ob, 0.02), v(b, yb + 0.3)]] {
+                    let t = if (t[1] - t[0]).cross(t[2] - t[0]).y > 0.0 { t } else { [t[0], t[2], t[1]] };
+                    grass.tri3(t, M_SPAN[M_GRASS]);
+                }
+            }
+        }
+        grass.tint = None;
         let entity = spawn_mesh(&mut commands, &mut meshes, grass.build(), &art.tiled[M_GRASS], None, false);
         for (m, y) in [(M_ASPHALT, 0.3), (M_PAVING, 0.16), (M_CONCRETE, 0.07), (M_WATER, 0.09)] {
             if !src.tris[m].is_empty() {
@@ -1583,7 +2113,11 @@ pub fn stream_world(
                 for t in &src.tris[m] {
                     f.tri_c(*t, y, M_SPAN[m], t.map(relief_shade));
                 }
-                spawn_mesh(&mut commands, &mut meshes, f.build(), &art.tiled[m], Some(entity), false);
+                if m == M_WATER {
+                    commands.spawn((Mesh3d(meshes.add(f.build())), MeshMaterial3d(art.water.clone()), Transform::default(), ChildOf(entity), NotShadowCaster));
+                } else {
+                    spawn_mesh(&mut commands, &mut meshes, f.build(), &art.tiled[m], Some(entity), false);
+                }
             }
         }
         // road paint
@@ -1607,6 +2141,68 @@ pub fn stream_world(
                 spawn_mesh(&mut commands, &mut meshes, uf.build(), &art.tiled[mat], Some(root), false);
             }
         }
+        // Zebra crossings. The bars are set out from the road, not from the mapped walking line
+        // (which may stop at the centre line, or cut a corner at a junction): half a metre wide,
+        // a metre apart across the carriageway, lying along the traffic, from kerb to kerb.
+        let mut zebra: Vec<(Vec2, Vec2)> = vec![];
+        for path in &src.zebras {
+            let last = path.len() - 2;
+            for (wi, w) in path.windows(2).enumerate() {
+                let (p0, p1) = (w[0], w[1]);
+                let len = p0.distance(p1);
+                if len < 0.05 {
+                    continue;
+                }
+                // road pieces this stretch of the path lies on, nearest first; one per road
+                let mid = (p0 + p1) * 0.5;
+                let mut near: Vec<(f32, usize)> = src
+                    .roads
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, (a, b, hw, _, ry))| ry.abs() < 1.5 && seg_dist(p0, *a, *b).min(seg_dist(p1, *a, *b)).min(seg_dist(mid, *a, *b)) < *hw)
+                    .map(|(i, (a, b, _, _, _))| (seg_dist(mid, *a, *b), i))
+                    .collect();
+                near.sort_by(|x, y| x.0.total_cmp(&y.0));
+                let mut done: Vec<u32> = vec![];
+                for (_, i) in near {
+                    let (a, b, hw, id, _) = src.roads[i];
+                    if done.contains(&id) {
+                        continue;
+                    }
+                    let rd = (b - a).normalize_or_zero();
+                    let n = Vec2::new(-rd.y, rd.x);
+                    // position across the road at both ends of this stretch
+                    let (u0, u1) = ((p0 - a).dot(n), (p1 - a).dot(n));
+                    if (u1 - u0).abs() < 0.35 * len {
+                        continue; // walking along the road here, not across it
+                    }
+                    done.push(id);
+                    let lim = hw - 0.3;
+                    let (mut lo, mut hi) = (u0.min(u1), u0.max(u1));
+                    // the open ends of the path carry on to the kerb
+                    if wi == 0 {
+                        if u0 < u1 { lo = -lim } else { hi = lim }
+                    }
+                    if wi == last {
+                        if u1 > u0 { hi = lim } else { lo = -lim }
+                    }
+                    let (lo, hi) = (lo.max(-lim), hi.min(lim));
+                    let mut u = (lo - 0.25).ceil() + 0.5 - if (lo - 0.25).ceil() - lo > 0.75 { 1.0 } else { 0.0 };
+                    while u <= hi + 0.01 {
+                        let c = p0 + (p1 - p0) * ((u - u0) / (u1 - u0));
+                        if c.distance(mid) < 20.0 && !zebra.iter().any(|(z, _)| z.distance_squared(c) < 0.6 * 0.6) {
+                            zebra.push((c, rd));
+                        }
+                        u += 1.0;
+                    }
+                }
+            }
+        }
+        for (c, rd) in &zebra {
+            let (l, h) = (*rd * 2.0, Vec2::new(-rd.y, rd.x) * 0.25);
+            let v = |p: Vec2| Vec3::new(p.x, 0.37, p.y);
+            mb.quad(up_quad([v(*c - l - h), v(*c - l + h), v(*c + l + h), v(*c + l - h)]), T_WHITE, 0, [0.86, 0.86, 0.82, 1.0]);
+        }
         for (pts, tile, shade, id) in &src.quads {
             if *tile == 0 {
                 // lane and edge lines stop where they would run across a different road:
@@ -1625,8 +2221,19 @@ pub fn stream_world(
                     continue;
                 }
             }
+            if *tile == 0 && *shade == 130 {
+                // lane dashes stop for a zebra crossing
+                let c = (pts[0] + pts[2]) * 0.5;
+                if zebra.iter().any(|(z, _)| z.distance_squared(c.xz()) < 3.2 * 3.2) {
+                    continue;
+                }
+            }
             let s = *shade as f32 / 255.0;
-            let (t, col, y) = if *tile == 3 { (T_CROSS, WHITE, 0.35) } else { (T_WHITE, [s * 0.85, s * 0.85, s * 0.78, 1.0], 0.36) };
+            let (t, col, y) = if *tile == 3 {
+                (T_WHITE, [0.86, 0.86, 0.82, 1.0], 0.37)
+            } else if *tile == 4 {
+                (T_WHITE, [0.8, 0.6, 0.08, 1.0], 0.36)
+            } else { (T_WHITE, [s * 0.85, s * 0.85, s * 0.78, 1.0], 0.36) };
             let target = if below(&[pts[0].y, pts[2].y]) { &mut umb } else { &mut mb };
             target.quad(pts.map(|p| p + Vec3::Y * y), t, 0, col);
         }
@@ -1658,11 +2265,7 @@ pub fn stream_world(
                     let inw = out * -0.45;
                     target.quad(up_quad([t0, v(p + inw, yp + 0.95), v(q + inw, yq + 0.95), t1]), T_METAL, 0, [1.0, 0.72, 0.3, 1.0]);
                 }
-                1 => {
-                    // grassed embankment sloping down to the ground
-                    let (op, oq) = (p + out * (yp * 1.7 + 0.3), q + out * (yq * 1.7 + 0.3));
-                    target.quad(up_quad([v(p, yp + sy), v(op, 0.02), v(oq, 0.02), v(q, yq + sy)]), T_GRASS, 0, [0.75, 0.8, 0.8, 1.0]);
-                }
+                1 => {} // embankment: part of the lawn mesh above
                 2 => {
                     let wallc = [0.3, 0.3, 0.36, 1.0];
                     target.quad([v(q, 0.0), v(q, yq), v(p, yp), v(p, 0.0)], T_METAL, 0, wallc);
@@ -1687,6 +2290,12 @@ pub fn stream_world(
         // from here on: free-standing objects, each lifted to the ground height where it stands
         mb.drape = None;
         for (mn, mx, tile, col) in &src.boxes {
+            // bridge pier: never in a carriageway or path passing underneath, nor in the river
+            let foot = ((*mn + *mx) * 0.5).xz();
+            if [Vec2::ZERO, Vec2::X, -Vec2::X, Vec2::Y, -Vec2::Y].iter().any(|d| city.surface(foot + *d * 1.3) != S_GRASS) {
+                continue;
+            }
+            posts.push((foot, 0.7));
             mb.lift = terrain(((*mn + *mx) * 0.5).xz());
             mb.boxx(*mn, *mx, *tile, *tile, *col);
         }
@@ -1700,7 +2309,8 @@ pub fn stream_world(
                 let pr = (*rad * 0.3).min(3.0);
                 mb.prism(*c0, pr, pr, 0.32, 1.1, 10, 0.3, T_METAL, T_STRIP + k, WHITE);
                 mb.prism(*c0, pr * 0.45, 0.12, 1.1, 6.5, 6, 0.0, T_METAL, T_HEADLIGHT, WHITE);
-                glow.ground(c0.x - rad * 1.6, c0.y - rad * 1.6, c0.x + rad * 1.6, c0.y + rad * 1.6, 0.4, T_GLOW, 0, rgb(nc, 0.22));
+                let gr = (*rad * 1.6).min(14.0);
+                glow.ground(c0.x - gr, c0.y - gr, c0.x + gr, c0.y + gr, 0.4, T_GLOW, 0, rgb(nc, 0.14));
                 lights.push(LightSite { pos: Vec3::new(c0.x, 3.5, c0.y), color: nc, power: 1.3 });
                 for j in 0..6 {
                     let p = *c0 + Vec2::from_angle(j as f32 * 1.047 + 0.4) * (*rad * 0.68);
@@ -1708,34 +2318,127 @@ pub fn stream_world(
                 }
             }
         }
+        // Signals, speed cameras and bus stops are mapped as points on (or right by) the road's
+        // centre line. They are stood on the verge instead: returns the spot `clear` metres
+        // outside the kerb of whatever carriageway the point is on, the direction of that road,
+        // and which way the road lies from there.
+        let roadside = |p: Vec2, clear: f32| -> (Vec2, Vec2, Vec2) {
+            let mut pos = p;
+            let mut dir = Vec2::X;
+            let mut toward = Vec2::ZERO;
+            for _ in 0..4 {
+                let hit = src
+                    .roads
+                    .iter()
+                    .filter(|(a, b, hw, _, ry)| ry.abs() < 1.5 && seg_dist(pos, *a, *b) < *hw + clear - 0.05)
+                    .min_by(|x, y| seg_dist(pos, x.0, x.1).total_cmp(&seg_dist(pos, y.0, y.1)));
+                let Some((a, b, hw, _, _)) = hit else { break };
+                let ab = *b - *a;
+                let rd = ab.normalize_or_zero();
+                let n = Vec2::new(-rd.y, rd.x);
+                let t = ((pos - *a).dot(ab) / ab.length_squared().max(1e-6)).clamp(0.0, 1.0);
+                let foot = *a + ab * t;
+                let off = (pos - foot).dot(n);
+                // keep to the side it is already on; from the centre line go to the right of travel
+                let side = if off < -0.3 { -1.0 } else { 1.0 };
+                pos = foot + n * side * (*hw + clear);
+                dir = rd;
+                toward = -n * side;
+            }
+            (pos, dir, toward)
+        };
+        // ...and then checked against the surface map: nothing is ever stood on asphalt or in
+        // water. If the spot is not clear (a junction mouth, a lay-by, another carriageway), the
+        // nearest clear one is found by searching outwards, first in the direction away from the road.
+        let clear_spot = |p: Vec2, rad: f32, away: Vec2| -> Vec2 {
+            let ok = |q: Vec2| {
+                [(0.0, 0.0), (rad, 0.0), (-rad, 0.0), (0.0, rad), (0.0, -rad)].iter().all(|(dx, dz)| {
+                    let s = city.surface(q + Vec2::new(*dx, *dz));
+                    s != S_ROAD && s != S_WATER
+                })
+            };
+            if ok(p) {
+                return p;
+            }
+            let a0 = if away == Vec2::ZERO { 0.0 } else { away.to_angle() };
+            for r in 1..=18 {
+                for k in 0..16 {
+                    // fan out from `away`: 0, +1, -1, +2, -2 ... sixteenths of a turn
+                    let step = ((k + 1) / 2) as f32 * if k % 2 == 0 { -1.0 } else { 1.0 };
+                    let q = p + Vec2::from_angle(a0 + step * std::f32::consts::TAU / 16.0) * r as f32;
+                    if ok(q) {
+                        return q;
+                    }
+                }
+            }
+            p
+        };
         for (p, _) in &src.cams {
             // speed camera: grey mast, striped housing, lens facing the road
-            mb.lift = terrain(*p);
-            mb.prism(*p, 0.14, 0.11, 0.0, 3.6, 6, 0.0, T_METAL, T_METAL, [0.7, 0.7, 0.75, 1.0]);
+            let (p, _, toward) = roadside(*p, 1.3);
+            let p = clear_spot(p, 0.5, -toward);
+            mb.lift = terrain(p);
+            posts.push((p, 0.2));
+            mb.prism(p, 0.14, 0.11, 0.0, 3.6, 6, 0.0, T_METAL, T_METAL, [0.7, 0.7, 0.75, 1.0]);
             mb.boxx(Vec3::new(p.x - 0.55, 3.6, p.y - 0.4), Vec3::new(p.x + 0.55, 4.5, p.y + 0.4), T_METAL, T_STRIP + 6, WHITE);
             mb.boxx(Vec3::new(p.x - 0.2, 3.85, p.y - 0.46), Vec3::new(p.x + 0.2, 4.25, p.y + 0.46), T_HEADLIGHT, T_HEADLIGHT, WHITE);
             glow.ground(p.x - 2.5, p.y - 2.5, p.x + 2.5, p.y + 2.5, 4.4, T_GLOW, 0, [0.35, 0.22, 0.03, 1.0]);
         }
-        for (p, kind) in &src.props {
-            mb.lift = terrain(*p);
+        for (p0, kind) in &src.props {
             if *kind == 0 {
-                // traffic signal: mast with a three-lamp head
-                mb.prism(*p, 0.12, 0.09, 0.0, 5.0, 5, 0.0, T_METAL, T_METAL, WHITE);
-                for (j, t) in [T_TAILLIGHT, T_STRIP + 6, T_STRIP + 3].iter().enumerate() {
-                    let x = p.x - 0.6 + j as f32 * 0.42;
-                    mb.boxx(Vec3::new(x, 5.0, p.y - 0.2), Vec3::new(x + 0.38, 5.35, p.y + 0.2), T_METAL, *t, WHITE);
+                // traffic signal: mast on the verge, arm reaching out over the lanes, three-lamp head
+                let (p, _, toward) = roadside(*p0, 1.2);
+                let p = clear_spot(p, 0.4, -toward);
+                // the arm points back at the spot on the road the signal controls
+                let toward = (*p0 - p).normalize_or(toward);
+                mb.lift = terrain(p);
+                posts.push((p, 0.2));
+                mb.prism(p, 0.12, 0.09, 0.0, 5.2, 5, 0.0, T_METAL, T_METAL, WHITE);
+                let head = p + toward * if toward == Vec2::ZERO { 0.0 } else { 2.6f32.min(p.distance(*p0)) };
+                if head != p {
+                    mb.wall(p, head, 4.95, 5.12, T_METAL, WHITE);
+                    mb.wall(head, p, 4.95, 5.12, T_METAL, WHITE);
+                    mb.flat_quad([p + toward.perp() * 0.06, p - toward.perp() * 0.06, head - toward.perp() * 0.06, head + toward.perp() * 0.06], 5.12, T_METAL, WHITE);
                 }
-                glow.ground(p.x - 2.2, p.y - 2.2, p.x + 2.2, p.y + 2.2, 5.5, T_GLOW, 0, [0.12, 0.3, 0.1, 1.0]);
+                for (j, t) in [T_TAILLIGHT, T_STRIP + 6, T_STRIP + 3].iter().enumerate() {
+                    let x = head.x - 0.6 + j as f32 * 0.42;
+                    mb.boxx(Vec3::new(x, 5.0, head.y - 0.2), Vec3::new(x + 0.38, 5.35, head.y + 0.2), T_METAL, *t, WHITE);
+                }
+                glow.ground(head.x - 2.2, head.y - 2.2, head.x + 2.2, head.y + 2.2, 5.5, T_GLOW, 0, [0.12, 0.3, 0.1, 1.0]);
             } else {
-                // bus shelter with a lit advertising panel
+                // bus shelter on its own paved platform beside the road, open side to the kerb,
+                // glass back, bench, lit advertising panel at one end
+                let (p, ax, toward) = roadside(*p0, 2.9);
+                let back = if toward == Vec2::ZERO { ax.perp() } else { -toward };
+                let p = clear_spot(p, 2.0, back);
+                mb.lift = terrain(p);
+                let at = |a: f32, s: f32| p + ax * a + back * s;
+                for a in [-1.5f32, 0.0, 1.5] {
+                    posts.push((at(a, 0.2), 0.8));
+                }
                 let s = hash2(p.x as i32, p.y as i32, 8) % 16;
                 let nc = NEON[(s % 8) as usize];
-                for (dx, dz) in [(-1.9, -0.7), (1.9, -0.7), (-1.9, 0.7), (1.9, 0.7)] {
-                    mb.boxx(Vec3::new(p.x + dx - 0.06, 0.0, p.y + dz - 0.06), Vec3::new(p.x + dx + 0.06, 2.5, p.y + dz + 0.06), T_METAL, T_METAL, WHITE);
+                // platform from the kerb to behind the shelter
+                mb.flat_quad([at(-3.2, -2.7), at(-3.2, 1.4), at(3.2, 1.4), at(3.2, -2.7)], 0.19, T_SIDEWALK, WHITE);
+                for (a, sd) in [(-1.9f32, -0.7f32), (1.9, -0.7), (-1.9, 0.7), (1.9, 0.7)] {
+                    mb.prism(at(a, sd), 0.07, 0.07, 0.0, 2.5, 4, ax.to_angle() + 0.785, T_METAL, T_METAL, WHITE);
                 }
-                mb.boxx(Vec3::new(p.x - 2.1, 2.5, p.y - 0.9), Vec3::new(p.x + 2.1, 2.62, p.y + 0.9), T_METAL, T_GLASS, WHITE);
-                mb.boxx(Vec3::new(p.x + 1.5, 0.3, p.y - 0.75), Vec3::new(p.x + 1.62, 2.3, p.y + 0.75), T_SIGN + s, T_STRIP + (s % 8), WHITE);
-                mb.boxx(Vec3::new(p.x - 1.4, 0.0, p.y - 0.55), Vec3::new(p.x + 0.9, 0.5, p.y - 0.2), T_METAL, T_METAL, [0.6, 0.45, 0.3, 1.0]);
+                // roof
+                let roofq = [at(-2.15, -0.95), at(-2.15, 0.95), at(2.15, 0.95), at(2.15, -0.95)];
+                mb.flat_quad(roofq, 2.62, T_GLASS, WHITE);
+                for i in 0..4 {
+                    mb.wall(roofq[(i + 1) % 4], roofq[i], 2.5, 2.62, T_METAL, WHITE);
+                    mb.wall(roofq[i], roofq[(i + 1) % 4], 2.5, 2.62, T_METAL, WHITE);
+                }
+                // glass back and the advertising panel
+                mb.wall(at(-1.9, 0.72), at(1.9, 0.72), 0.3, 2.3, T_GLASS, [0.7, 0.85, 1.0, 1.0]);
+                mb.wall(at(1.9, 0.72), at(-1.9, 0.72), 0.3, 2.3, T_GLASS, [0.7, 0.85, 1.0, 1.0]);
+                mb.wall(at(1.9, -0.7), at(1.9, 0.7), 0.3, 2.3, T_SIGN + s, WHITE);
+                mb.wall(at(1.9, 0.7), at(1.9, -0.7), 0.3, 2.3, T_SIGN + s, WHITE);
+                // bench
+                mb.flat_quad([at(-1.4, 0.2), at(-1.4, 0.6), at(1.0, 0.6), at(1.0, 0.2)], 0.5, T_METAL, [0.6, 0.45, 0.3, 1.0]);
+                mb.wall(at(-1.4, 0.2), at(1.0, 0.2), 0.0, 0.5, T_METAL, [0.45, 0.33, 0.22, 1.0]);
+                mb.wall(at(1.0, 0.2), at(-1.4, 0.2), 0.0, 0.5, T_METAL, [0.45, 0.33, 0.22, 1.0]);
                 glow.ground(p.x - 5.0, p.y - 5.0, p.x + 5.0, p.y + 5.0, 0.17, T_GLOW, 0, rgb(nc, 0.14));
                 lights.push(LightSite { pos: Vec3::new(p.x, 2.2, p.y), color: nc, power: 0.5 });
             }
@@ -1743,19 +2446,16 @@ pub fn stream_world(
         for &bi in &src.own {
             add_building(&city.blds[bi as usize], bi, &mut mb, &mut roof, &mut glow, &mut smb, &mut lights);
         }
+        for &li in &src.lms {
+            crate::landmarks::add_landmark(&city.landmarks[li as usize], &mut mb, &mut roof, &mut glow, &mut lights);
+        }
+        for (i, (p, hd)) in src.planes.iter().enumerate() {
+            mb.lift = 0.0;
+            add_plane(&mut mb, *p, *hd, terrain(*p) + 0.3, hash2(p.x as i32, p.y as i32, 4) as usize + i);
+        }
         for (p, s) in &src.trees {
             mb.lift = terrain(*p);
-            let k = *s as f32 / 255.0;
-            let r = 1.7 + k * 1.9;
-            let g = 0.7 + ((*s as u32 * 37) % 100) as f32 * 0.006;
-            let hgt = 3.2 + k * 3.5;
-            let leaf = if *s % 7 == 0 { T_LEAF + 1 } else { T_LEAF };
-            let rot = k * 6.0;
-            mb.prism(*p, 0.28, 0.2, 0.0, hgt, 5, rot, T_METAL, T_METAL, [0.45, 0.28, 0.2, 1.0]);
-            let o2 = Vec2::from_angle(rot) * r * 0.22;
-            mb.prism(*p, r, r * 0.9, hgt, hgt + 1.3, 7, rot, leaf, leaf, [g * 0.7, g * 0.7, g * 0.7, 1.0]);
-            mb.prism(*p + o2, r * 0.72, r * 0.6, hgt + 1.3, hgt + 2.5, 6, rot + 0.5, leaf, leaf, [g, g, g, 1.0]);
-            mb.prism(*p - o2 * 0.6, r * 0.42, r * 0.25, hgt + 2.5, hgt + 3.5, 5, rot + 1.1, leaf, leaf, [g * 1.35, g * 1.35, g * 1.35, 1.0]);
+            add_tree(&mut mb, *p, *s);
         }
         for (p, kind, base) in &src.lights {
             if city.in_building(*p, 0.6) {
@@ -1765,10 +2465,13 @@ pub fn stream_world(
             // never plant a lamp on a carriageway, path or neighbouring lane: on dual carriageways,
             // slip roads and wide junctions the usual roadside spot belongs to another road
             let on_road = *kind != 4
-                && (src.roads.iter().any(|(a, b, hw, _, ry)| (ry - base).abs() < 1.5 && seg_dist(*p, *a, *b) < hw + 0.3)
+                && (src.roads.iter().any(|(a, b, hw, _, ry)| (ry - base).abs() < 1.5 && seg_dist(*p, *a, *b) < hw + 1.3)
                     || (base < 0.4 && src.segs.iter().any(|(a, b, hw)| seg_dist(*p, *a, *b) < hw - 0.2)));
-            if on_road {
+            if on_road || (*kind != 4 && base.abs() < 0.4 && city.surface(*p) == S_ROAD) {
                 continue;
+            }
+            if *kind != 4 && base.abs() < 1.0 {
+                posts.push((*p, 0.22)); // lamp post
             }
             mb.lift = terrain(*p);
             if *kind == 4 {
@@ -1838,7 +2541,7 @@ pub fn stream_world(
             l.pos.y += terrain(l.pos.xz());
         }
         commands.entity(entity).insert(Visibility::Inherited);
-        city.cells.insert(c, Loaded { lights, entity, under });
+        city.cells.insert(c, Loaded { lights, posts, entity, under });
     }
 }
 
@@ -1890,7 +2593,7 @@ pub fn assign_lights(
             // a few tired neon tubes and lamps stutter
             let h = hash2((s.pos.x * 3.0) as i32, (s.pos.z * 3.0) as i32, 99);
             let flick = if h % 6 == 0 && hash2(h as i32, (game.time * 7.0) as i32, 5) % 10 < 3 { 0.2 } else { 1.0 };
-            pl.intensity = crate::LIGHT_POWER * s.power * fade * flick * (0.05 + 0.95 * game.night);
+            pl.intensity = crate::LIGHT_POWER * s.power * fade * flick * (0.01 + 0.99 * game.night);
             pl.color = Color::linear_rgb(s.color[0], s.color[1], s.color[2]);
             t.translation = s.pos;
         } else {
@@ -1950,14 +2653,15 @@ pub fn deck_fade(
     mut alpha: Local<Option<f32>>,
 ) {
     let cur = alpha.unwrap_or(1.0);
-    let want = if city.under_deck(game.pos, game.y) { 0.3 } else { 1.0 };
+    let want = if city.under_deck(game.pos, game.y) { 0.42 } else { 1.0 };
     let next = cur + (want - cur).clamp(-time.delta_secs() * 3.5, time.delta_secs() * 3.5);
     if (next - cur).abs() < 1e-4 && alpha.is_some() {
         return;
     }
     *alpha = Some(next);
     if let Some(mut m) = mats.get_mut(&art.deck) {
-        m.base_color = Color::linear_rgba(1.12, 1.12, 1.2, next);
+        // (same tone as the road on the ground, so a ramp does not show as a paler slab where it leaves it)
+        m.base_color = Color::linear_rgba(1.0, 1.0, 1.0, next);
         m.alpha_mode = if next > 0.995 { AlphaMode::Opaque } else { AlphaMode::Blend };
     }
 }
